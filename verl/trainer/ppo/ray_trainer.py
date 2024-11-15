@@ -31,6 +31,12 @@ from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClass
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl import DataProto
 from verl.trainer.ppo import core_algos
+from single_controller.ray.decorator import dispatch_dp_compute_data_proto, collect_dp_compute_data_proto
+
+
+import ray
+from ray.dag import InputNode, MultiOutputNode
+
 
 WorkerType = Type[Worker]
 
@@ -241,6 +247,17 @@ class RayPPOTrainer(object):
 
     def _create_dataloader(self):
         from torch.utils.data import DataLoader
+        import torch
+        import random
+        import numpy as np
+        
+        # Set seeds if provided in config
+        seed = self.config.data.get('seed', None)
+        if seed is not None:
+            torch.manual_seed(seed)
+            random.seed(seed)
+            np.random.seed(seed)
+
         # TODO: we have to make sure the batch size is divisible by the dp size
         from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
         self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
@@ -330,7 +347,7 @@ class RayPPOTrainer(object):
             metric_dict[f'test_score/{data_source}'] = np.mean(rewards)
 
         return metric_dict
-
+        
     def init_workers(self):
         """Init resource pool and worker group"""
         self.resource_pool_manager.create_resource_pool()
@@ -398,6 +415,31 @@ class RayPPOTrainer(object):
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
+        
+        
+        
+        
+    def debug_compiled_dag(self, batch):
+        
+        with InputNode() as splitted_batch:
+            # Generation step (actor_rollout_ is appended to method name)
+            gen_output = self.actor_rollout_wg.bind_all("actor_rollout_generate_sequences", splitted_batch)
+            dag = MultiOutputNode(gen_output)
+        dag = dag.experimental_compile()
+        print("successfully compiled dag!")
+        
+        # split
+        splitted_batch, _ = dispatch_dp_compute_data_proto(self.actor_rollout_wg, batch)
+        for i in range(len(splitted_batch[0])):
+            print(f"splitted_batch[{i}] = {splitted_batch[0][i]}")
+        
+        # execute
+        splitted_output = ray.get(dag.execute(*splitted_batch[0]))
+        
+        # concatenate
+        rcg_output = collect_dp_compute_data_proto(self.actor_rollout_wg, splitted_output)
+        return rcg_output
+        
 
     def fit(self):
         """
@@ -414,88 +456,83 @@ class RayPPOTrainer(object):
                           config=OmegaConf.to_container(self.config, resolve=True))
 
         global_steps = 0
+        # self.additional_worker = RemoteWorker()
+        # self.additional_worker.compute_advantage()
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None:
-            val_metrics = self._validate()
-            pprint(f'Initial validation metrics: {val_metrics}')
-            logger.log(data=val_metrics, step=global_steps)
-            if self.config.trainer.get('val_only', False):
-                return
+        # if self.val_reward_fn is not None:
+        #     val_metrics = self._validate()
+        #     pprint(f'Initial validation metrics: {val_metrics}')
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
-                metrics = {}
+                with Timer(name='full_step', logger=None) as full_timer:
+                    metrics = {}
 
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
-                # batch = batch.to('cuda')
+                    batch: DataProto = DataProto.from_single_dict(batch_dict)
+                    gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])                    
 
-                # pop those keys for generation
-                gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+                    # generate a batch
+                    with Timer(name='gen', logger=None) as timer:
+                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                    metrics['timing/gen'] = timer.last
+                                        
+                    # debug compiled dag
+                    rcg_gen_batch_output = self.debug_compiled_dag(gen_batch) # TODO: remove this
+                    
+                    breakpoint()
 
-                # generate a batch
-                with Timer(name='gen', logger=None) as timer:
-                    gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                metrics['timing/gen'] = timer.last
+                    batch = batch.union(gen_batch_output)
 
-                batch = batch.union(gen_batch_output)
+                    if self.use_reference_policy:
+                        with Timer(name='ref', logger=None) as timer:
+                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            batch = batch.union(ref_log_prob)
+                        metrics['timing/ref'] = timer.last
 
-                if self.use_reference_policy:
-                    # compute reference log_prob
-                    with Timer(name='ref', logger=None) as timer:
-                        ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                        batch = batch.union(ref_log_prob)
-                    metrics['timing/ref'] = timer.last
+                    # compute values
+                    with Timer(name='values', logger=None) as timer:
+                        values = self.critic_wg.compute_values(batch)
+                        batch = batch.union(values)
+                    metrics['timing/values'] = timer.last
 
-                # compute values
-                with Timer(name='values', logger=None) as timer:
-                    values = self.critic_wg.compute_values(batch)
-                    batch = batch.union(values)
-                metrics['timing/values'] = timer.last
+                    with Timer(name='adv', logger=None) as timer:
+                        if self.use_rm:
+                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            batch = batch.union(reward_tensor)
 
-                with Timer(name='adv', logger=None) as timer:
-                    # compute scores. Support both model and function-based.
-                    # We first compute the scores using reward model. Then, we call reward_fn to combine
-                    # the results from reward model and rule-based results.
-                    if self.use_rm:
-                        # we first compute reward model score
-                        reward_tensor = self.rm_wg.compute_rm_score(batch)
-                        batch = batch.union(reward_tensor)
+                        reward_tensor = self.reward_fn(batch)
+                        batch.batch['token_level_scores'] = reward_tensor
 
-                    # we combine with rule-based rm
-                    reward_tensor = self.reward_fn(batch)
-                    batch.batch['token_level_scores'] = reward_tensor
+                        batch, kl_metrics = apply_kl_penalty(batch,
+                                                           kl_ctrl=self.kl_ctrl,
+                                                           kl_penalty=self.config.algorithm.kl_penalty)
+                        metrics.update(kl_metrics)
 
-                    # compute rewards. apply_kl_penalty if available
-                    batch, kl_metrics = apply_kl_penalty(batch,
-                                                         kl_ctrl=self.kl_ctrl,
-                                                         kl_penalty=self.config.algorithm.kl_penalty)
-                    metrics.update(kl_metrics)
+                        batch = compute_advantage(batch,
+                                               self.config.algorithm.gamma,
+                                               self.config.algorithm.lam,
+                                               adv_estimator=self.config.algorithm.adv_estimator)
+                    metrics['timing/adv'] = timer.last
 
-                    # compute advantages, executed on the driver process
-                    batch = compute_advantage(batch,
-                                              self.config.algorithm.gamma,
-                                              self.config.algorithm.lam,
-                                              adv_estimator=self.config.algorithm.adv_estimator)
-                metrics['timing/adv'] = timer.last
+                    # update critic
+                    if self.use_critic:
+                        with Timer(name='update_critic', logger=None) as timer:
+                            critic_output = self.critic_wg.update_critic(batch)
+                        metrics['timing/update_critic'] = timer.last
+                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                        metrics.update(critic_output_metrics)
 
-                # update critic
-                if self.use_critic:
-                    with Timer(name='update_critic', logger=None) as timer:
-                        critic_output = self.critic_wg.update_critic(batch)
-                    metrics['timing/update_critic'] = timer.last
-                    critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
-                    metrics.update(critic_output_metrics)
+                    # implement critic warmup
+                    if self.config.trainer.critic_warmup <= global_steps:
+                        with Timer(name='update_actor', logger=None) as timer:
+                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                        metrics['timing/update_actor'] = timer.last
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                        metrics.update(actor_output_metrics)
 
-                # implement critic warmup
-                if self.config.trainer.critic_warmup <= global_steps:
-                    # update actor
-                    with Timer(name='update_actor', logger=None) as timer:
-                        actor_output = self.actor_rollout_wg.update_actor(batch)
-                    metrics['timing/update_actor'] = timer.last
-                    actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                    metrics.update(actor_output_metrics)
+                metrics['timing/full_step'] = full_timer.last
 
                 # validate
                 if self.val_reward_fn is not None and (global_steps + 1) % self.config.trainer.test_freq == 0:
@@ -530,4 +567,4 @@ class RayPPOTrainer(object):
         if self.val_reward_fn is not None:
             val_metrics = self._validate()
             pprint(f'Final validation metrics: {val_metrics}')
-            logger.log(data=val_metrics, step=global_steps)
+            # logger.log(data=val_metrics, step=global_steps)
