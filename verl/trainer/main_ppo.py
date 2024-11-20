@@ -120,8 +120,8 @@ def main_task(config):
     # define worker classes
     if config.actor_rollout_ref.actor.strategy == 'fsdp':
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-        from verl.trainer.ppo.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
-        from verl.single_controller.ray import RayWorkerGroup
+        from verl.trainer.ppo.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker, ReturnEstimatorWorker
+        from single_controller.ray import RayWorkerGroup
         ray_worker_group_cls = RayWorkerGroup
 
     elif config.actor_rollout_ref.actor.strategy == 'megatron':
@@ -138,7 +138,8 @@ def main_task(config):
     role_worker_mapping = {
         Role.ActorRollout: ActorRolloutRefWorker,
         Role.Critic: CriticWorker,
-        Role.RefPolicy: ActorRolloutRefWorker
+        Role.RefPolicy: ActorRolloutRefWorker,
+        Role.ReturnEstimator: ReturnEstimatorWorker,
     }
 
     global_pool_id = 'global_pool'
@@ -149,6 +150,7 @@ def main_task(config):
         Role.ActorRollout: global_pool_id,
         Role.Critic: global_pool_id,
         Role.RefPolicy: global_pool_id,
+        Role.ReturnEstimator: global_pool_id,
     }
 
     # we should adopt a multi-source reward function here
