@@ -182,17 +182,19 @@ class RayWorkerGroup(WorkerGroup):
                  name_prefix: str = None,
                  detached=False,
                  worker_names=None,
+                 worker_name_to_worker=None,
                  **kwargs) -> None:
         super().__init__(resource_pool=resource_pool, **kwargs)
         self.ray_cls_with_init = ray_cls_with_init
         self.name_prefix = get_random_string(length=6) if name_prefix is None else name_prefix
+        self._worker_name_to_worker = {} if worker_name_to_worker is None else worker_name_to_worker
 
         if worker_names is not None:
             assert self._is_init_with_detached_workers
             self._worker_names = worker_names
 
         if self._is_init_with_detached_workers:
-            self._init_with_detached_workers(worker_names=worker_names)
+            self._init_with_detached_workers(worker_names=worker_names, worker_name_to_worker=worker_name_to_worker)
         else:
             self._init_with_resource_pool(resource_pool=resource_pool,
                                           ray_cls_with_init=ray_cls_with_init,
@@ -206,8 +208,11 @@ class RayWorkerGroup(WorkerGroup):
         worker_state_dict = get_actor(worker._actor_id.hex())
         return worker_state_dict.get("state", "undefined") == "ALIVE" if worker_state_dict is not None else False
 
-    def _init_with_detached_workers(self, worker_names):
-        workers = [ray.get_actor(name=name) for name in worker_names]
+    def _init_with_detached_workers(self, worker_names, worker_name_to_worker):
+        workers = []
+        for name in worker_names:
+            assert name in worker_name_to_worker
+            workers.append(worker_name_to_worker[name])
         self._workers = workers
         self._world_size = len(worker_names)
 
@@ -262,6 +267,7 @@ class RayWorkerGroup(WorkerGroup):
                                            num_gpus=num_gpus)
                 self._workers.append(worker)
                 self._worker_names.append(name)
+                self._worker_name_to_worker[name] = worker
 
                 if rank == 0:
                     register_center_actor = None
@@ -282,11 +288,12 @@ class RayWorkerGroup(WorkerGroup):
         return self._worker_names
 
     @classmethod
-    def from_detached(cls, worker_names=None, ray_cls_with_init=None):
+    def from_detached(cls, worker_names=None, ray_cls_with_init=None, worker_name_to_worker=None):
         worker_group = cls(resource_pool=None,
                            ray_cls_with_init=ray_cls_with_init,
                            name_prefix=None,
-                           worker_names=worker_names)
+                           worker_names=worker_names,
+                           worker_name_to_worker=worker_name_to_worker)
         return worker_group
 
     def spawn(self, prefix_set):
@@ -310,7 +317,8 @@ class RayWorkerGroup(WorkerGroup):
         new_worker_group_dict = {}
         for prefix in prefix_set:
             new_worker_group = self.from_detached(worker_names=self._worker_names,
-                                                  ray_cls_with_init=self.ray_cls_with_init)
+                                                  ray_cls_with_init=self.ray_cls_with_init,
+                                                  worker_name_to_worker=self._worker_name_to_worker)
 
             _rebind_actor_methods(new_worker_group, prefix)
             new_worker_group_dict[prefix] = new_worker_group
