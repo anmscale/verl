@@ -39,7 +39,7 @@ from single_controller.ray.decorator import (
 
 import ray
 from ray.dag import InputNode, MultiOutputNode
-
+import copy
 
 WorkerType = Type[Worker]
 
@@ -400,9 +400,8 @@ class RayPPOTrainer(object):
         return_estimator_cls = RayClassWithInitArgs(
             cls=self.role_worker_mapping[Role.ReturnEstimator],
             config=self.config.algorithm,
-            # comment out for debugging
-            # reward_fn=self.reward_fn,
-            # kl_ctrl=self.kl_ctrl,
+            reward_fn=self.reward_fn,
+            kl_ctrl=self.kl_ctrl,
         )
         self.resource_pool_to_cls[resource_pool]["return"] = return_estimator_cls
 
@@ -412,50 +411,47 @@ class RayPPOTrainer(object):
         # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
         all_wg = {}
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            breakpoint()
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
             wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls)
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
 
-        # Amjad comment out init_model to speed up debugging
         if self.use_critic:
             self.critic_wg = all_wg['critic']
-            # self.critic_wg.init_model()
+            self.critic_wg.init_model()
 
         if self.use_reference_policy:
             self.ref_policy_wg = all_wg['ref']
-            # self.ref_policy_wg.init_model()
+            self.ref_policy_wg.init_model()
 
         if self.use_rm:
             self.rm_wg = all_wg['rm']
-            # self.rm_wg.init_model()
+            self.rm_wg.init_model()
 
         # Initialize return estimator worker group
         self.return_estimator_wg = all_wg["return"]
-        # self.return_estimator_wg.init_model()
+        self.return_estimator_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg['actor_rollout']
-        # self.actor_rollout_wg.init_model()
+        self.actor_rollout_wg.init_model()
 
         # TODO: Amjad move this to another class
         self._build_compiled_graph()
 
     def _build_compiled_graph(self):
-        print("actor_rollout_wg", self.actor_rollout_wg._workers)
-        print("ref_policy_wg", self.ref_policy_wg._workers)
-        print("critic_wg", self.critic_wg._workers)
-        print("return_estimator_wg", self.return_estimator_wg._workers)
+        print("num of actor_rollout_wg", len(self.actor_rollout_wg._workers))
+        print("num of ref_policy_wg", len(self.ref_policy_wg._workers))
+        print("num of critic_wg", len(self.critic_wg._workers))
+        print("num of return_estimator_wg", len(self.return_estimator_wg._workers))
         
         # comment out other inputs for debugging with a single GPU
         with InputNode() as graph_input:
-            tensor_data = graph_input[0], #, graph_input[1], graph_input[2], graph_input[3]
-            non_tensor_data = graph_input[1], #, graph_input[5], graph_input[6], graph_input[7]
-   
+            splitted_data = graph_input[0], graph_input[1], graph_input[2], graph_input[3]
+            
             # Generation step (actor_rollout_ is appended to method name)
             gen_output = self.actor_rollout_wg.bind_all(
-                "actor_rollout_generate_sequences", tensor_data
+                "actor_rollout_generate_sequences", splitted_data
             )
             print("gen_output", gen_output[0]._get_bind_index())
             ref_output = self.ref_policy_wg.bind_all(
@@ -467,7 +463,7 @@ class RayPPOTrainer(object):
             )
             print("critic_output", critic_output[0]._get_bind_index())
             return_estimator_output = self.return_estimator_wg.bind_all(  
-                "return_compute_scores_and_advantage", critic_output, non_tensor_data
+                "return_compute_scores_and_advantage", critic_output
             )
             print("return_estimator_output", return_estimator_output[0]._get_bind_index())
 
@@ -475,15 +471,31 @@ class RayPPOTrainer(object):
         self.compiled_dag = dag.experimental_compile(_execution_timeout=100000)
         print("successfully compiled dag!")
 
-    def debug_compiled_dag(self, tensor_data, non_tensor_data):
+    def debug_compiled_dag_old(self, tensor_data, non_tensor_data=None):
         # split
         splitted_tensor_data, _ = dispatch_dp_compute_data_proto(self.actor_rollout_wg, tensor_data)
-        splitted_non_tensor_data, _ = dispatch_dp_compute_data_proto(self.actor_rollout_wg, non_tensor_data)
-        # for i in range(len(splitted_gen_batch[0])):
-        #     print(f"splitted_gen_batch[{i}] = {splitted_gen_batch[0][i]}")
+        if non_tensor_data is not None:
+            splitted_non_tensor_data, _ = dispatch_dp_compute_data_proto(self.actor_rollout_wg, non_tensor_data)
+        else:
+            splitted_non_tensor_data = [[]]
 
+        splitted_data = splitted_tensor_data[0] + splitted_non_tensor_data[0]
         # execute
-        ref = self.compiled_dag.execute(*(splitted_tensor_data[0]+splitted_non_tensor_data[0]))
+        ref = self.compiled_dag.execute(*splitted_data)
+        splitted_output = ray.get(ref, timeout=100000)
+
+        # concatenate
+        rcg_output = collect_dp_compute_data_proto(
+            self.actor_rollout_wg, splitted_output
+        )
+        return rcg_output
+    
+    def debug_compiled_dag(self, data):
+        # split
+        splitted_data, _ = dispatch_dp_compute_data_proto(self.actor_rollout_wg, data)
+        
+        # execute
+        ref = self.compiled_dag.execute(*splitted_data[0])
         splitted_output = ray.get(ref, timeout=100000)
 
         # concatenate
@@ -525,8 +537,6 @@ class RayPPOTrainer(object):
                     gen_batch = batch.pop(
                         batch_keys=["input_ids", "attention_mask", "position_ids"]
                     )
-                    orig_batch = batch
-
                     # generate a batch
                     with Timer(name="gen", logger=None) as timer:
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(
@@ -549,17 +559,17 @@ class RayPPOTrainer(object):
                         critic_output_batch = self.critic_wg.compute_values(ref_output_batch)
                         # batch = batch.union(values)
                     metrics["timing/values"] = timer.last
-                                        
-                    batch = critic_output_batch
+                                                            
                     # adding this data for reward function computation
                     # TODO: convert this to a tensor
-                    batch.non_tensor_batch["reward_model"] = (
-                        orig_batch.non_tensor_batch["reward_model"]
+                    critic_output_batch.non_tensor_batch["reward_model"] = (
+                        batch.non_tensor_batch["reward_model"]
                     )
-                    batch.non_tensor_batch["data_source"] = orig_batch.non_tensor_batch[
+                    critic_output_batch.non_tensor_batch["data_source"] = batch.non_tensor_batch[
                         "data_source"
                     ]
-                    
+                    batch = copy.deepcopy(critic_output_batch)
+
                     with Timer(name="adv", logger=None) as timer:
                         if self.use_rm:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
@@ -582,9 +592,7 @@ class RayPPOTrainer(object):
                             adv_estimator=self.config.algorithm.adv_estimator,
                         )
                     metrics["timing/adv"] = timer.last
-                    
-                    non_tensor_data = orig_batch.pop(non_tensor_batch_keys=["reward_model", "data_source"])                    
-                    dag_output = self.debug_compiled_dag(gen_batch, non_tensor_data)
+                    dag_output = self.debug_compiled_dag(critic_output_batch)
                     breakpoint()
 
                     # update critic

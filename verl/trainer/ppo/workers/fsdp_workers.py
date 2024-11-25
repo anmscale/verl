@@ -823,27 +823,26 @@ class ReturnEstimatorWorker(Worker):
     without requiring a model.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, reward_fn, kl_ctrl):
         super().__init__()
         import torch.distributed
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl")
         self.config = config
-        # self.reward_fn = reward_fn
-        # self.kl_ctrl = kl_ctrl
+        self.reward_fn = reward_fn
+        self.kl_ctrl = kl_ctrl
         
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         # No model initialization needed
-        print("ReturnEstimatorWorker init_model")
-
+        pass
+    
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_scores_and_advantage(self, tensor_data: DataProto, non_tensor_data: DataProto):
+    def compute_scores_and_advantage(self, data: DataProto):
         """
         Combines reward computation, KL penalty, and advantage estimation in one step
         """
-        data = tensor_data.union(non_tensor_data)
 
         # Compute rewards
         reward_tensor = self.reward_fn(data)
