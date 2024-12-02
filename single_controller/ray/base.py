@@ -22,6 +22,8 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy, Nod
 from ray.experimental.state.api import get_actor
 
 from single_controller.base import WorkerGroup, ResourcePool, ClassWithInitArgs, Worker
+from ray.experimental.channel.torch_tensor_type import TorchTensorType
+
 
 __all__ = ['Worker']
 
@@ -356,18 +358,31 @@ class RayWorkerGroup(WorkerGroup):
 
         return [getattr(worker, method_name).remote(*args, **kwargs) for worker in self._workers]
 
-    def bind_all(self, method_name: str, tensor_data, non_tensor_data=None):
+    def bind_all(self, method_name: str, *args, num_returns=1, nccl=True):
         # Mirror the logic in execute_all_async but with bind
-        print("workers", self._workers)
         length = len(self._workers)
-        result = []
+        results = [list() for _ in range(num_returns)]
+        
         for i in range(length):
-            remote_call = getattr(self._workers[i], method_name)
-            if non_tensor_data is None:
-                result.append(remote_call.bind(tensor_data[i]))
+            remote_fn = getattr(self._workers[i], method_name)
+            sliced_args = tuple(arg[i] for arg in args)
+            remote_result = remote_fn.options(num_returns=num_returns).bind(*sliced_args)
+                
+            if num_returns == 1:
+                results[0].append(remote_result.with_type_hint(TorchTensorType(transport="nccl")) if nccl else remote_result)
             else:
-                result.append(remote_call.bind(tensor_data[i], non_tensor_data[i]))
-        return result
+                for j in range(num_returns):
+                    results[j].append(remote_result[j].with_type_hint(TorchTensorType(transport="nccl")) if nccl else remote_result[j])
+            
+        return results if num_returns > 1 else results[0]
+    
+    def bind_rank_zero(self, method_name: str, args, num_returns=1, nccl=True):
+        remote_fn = getattr(self._workers[0], method_name)
+        result = remote_fn.options(num_returns=num_returns).bind(*args)
+        if num_returns == 1:
+            return result.with_type_hint(TorchTensorType(transport="nccl")) if nccl else result
+        else:
+            return [result[i].with_type_hint(TorchTensorType(transport="nccl")) if nccl else result[i] for i in range(num_returns)]
 
     @property
     def master_address(self):
