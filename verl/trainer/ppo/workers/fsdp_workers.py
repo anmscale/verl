@@ -40,6 +40,9 @@ from verl.utils import hf_tokenizer
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
+# Add DEBUG flag at global level (near the top of the file, after imports)
+DEBUG = False
+
 
 @ray.remote
 class ActorRolloutRefWorker(Worker):
@@ -236,6 +239,7 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage('After building vllm rollout', logger=None)
             if torch.distributed.get_world_size() == 1:
                 self.config.rollout.load_format = 'dummy_hf'
+                
             sharding_manager = FSDPVLLMShardingManager(module=self.actor_module_fsdp,
                                                        inference_engine=rollout.inference_engine,
                                                        model_config=self.actor_model_config,
@@ -305,6 +309,8 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
+        if DEBUG:
+            print(f"update_actor data device: {data.batch.device}")
         data = data.to('cuda')
 
         assert self._is_actor
@@ -329,7 +335,7 @@ class ActorRolloutRefWorker(Worker):
 
         # TODO: here, we should return all metrics
         output = DataProto(meta_info={'metrics': metrics})
-        output = output.to('cpu')
+        # output = output.to('cpu')
 
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
@@ -351,27 +357,27 @@ class ActorRolloutRefWorker(Worker):
                                      load_grad=self._is_offload_grad)
 
         prompts.batch = prompts.batch.cuda()
+        
+
         meta_info = {'eos_token_id': self.tokenizer.eos_token_id, 'pad_token_id': self.tokenizer.pad_token_id}
         prompts.meta_info.update(meta_info)
         with self.sharding_manager:
             log_gpu_memory_usage('After entering sharding manager', logger=logger)
-
             prompts = self.sharding_manager.preprocess_data(prompts)
             output = self.rollout.generate_sequences(prompts=prompts)
-
             log_gpu_memory_usage('After rollout generation', logger=logger)
-
             output = self.sharding_manager.postprocess_data(output)
-
+            
         if self._is_actor and recompute_log_prob:
             # we should always recompute old_log_probs when it is HybridEngine
             output.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size
             output.meta_info['temperature'] = self.config.rollout.temperature
             old_log_probs = self.actor.compute_log_prob(data=output)
             output.batch['old_log_probs'] = old_log_probs
-
-        output = output.to('cpu')
-
+        output = output.to('cuda')
+        # output = output.to('cpu')
+        if DEBUG:
+            print(f'generate_sequences output device: {output.batch.device}')
         if self._is_offload_param:
             # NOTE(sgm): the grad is already in CPU, only offload param here
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
@@ -383,7 +389,8 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
-
+        if DEBUG:
+            print("data device ref_log_prob: ", data.batch.device)
         data = data.to('cuda')
 
         if self._is_offload_param:
@@ -394,13 +401,14 @@ class ActorRolloutRefWorker(Worker):
         micro_batch_size = self.config.ref.log_prob_micro_batch_size
         data.meta_info['micro_batch_size'] = micro_batch_size
         data.meta_info['temperature'] = self.config.rollout.temperature
-        # Amjad try this
+        if DEBUG:
+            print(f'compute_ref_log_prob device: {data.batch.device}')
+        
         ref_log_prob = self.ref_policy.compute_log_prob(data=data)
-        output = data
-        output.batch['ref_log_prob'] = ref_log_prob
-        # output = DataProto.from_dict(tensors={'ref_log_prob': output})
-
-        output = output.to('cpu')
+        output = DataProto.from_dict(tensors={'ref_log_prob': ref_log_prob})
+        if DEBUG:
+            print(f'compute_ref_log_prob output device: {output.batch.device}')
+        # output = output.to('cpu')
 
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.ref_module_fsdp, offload_grad=self._is_offload_grad)
@@ -576,6 +584,8 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_values(self, data: DataProto):
+        if DEBUG:
+            print("data device compute_values: ", data.batch.device)
         data = data.to('cuda')
 
         if self._is_offload_param:
@@ -584,13 +594,16 @@ class CriticWorker(Worker):
                                      load_grad=self._is_offload_grad)
         micro_batch_size = self.config.ppo_micro_batch_size
         data.meta_info['micro_batch_size'] = micro_batch_size
+        
+        if DEBUG:
+            print(f'compute_values device: {data.batch.device}')
+        
         values = self.critic.compute_values(data=data)
         
-        # Amjad try this
-        # output = DataProto.from_dict(tensors={'values': values})
-        data.batch['values'] = values
-        output = data
-        output = output.to('cpu')
+        output = DataProto.from_dict(tensors={'values': values})
+        # output = output.to('cpu')
+        if DEBUG:
+            print(f'compute_values output device: {output.batch.device}')
 
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
@@ -599,6 +612,8 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_critic(self, data: DataProto):
+        if DEBUG:
+            print(f"update_critic data device: {data.batch.device}")
         data = data.to('cuda')
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.critic_module,
@@ -618,7 +633,7 @@ class CriticWorker(Worker):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
         torch.cuda.empty_cache()
-        output = output.to('cpu')
+        # output = output.to('cpu')
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -812,15 +827,16 @@ class RewardModelWorker(Worker):
         token_level_scores = self._expand_to_token_level(data, scores)
         # Note that this is only the scores, may not be the final rewards used to train RL
         output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
-        output = output.to('cpu')
+        # output = output.to('cpu')
         torch.cuda.empty_cache()
+        if DEBUG:
+            print(f"compute_rm_score device: {data.batch.device}")
         return output
 
 @ray.remote
-class ReturnEstimatorWorker(Worker):
+class AuxiliaryWorker(Worker):
     """
-    Worker that handles reward function computation, KL penalty, and advantage estimation
-    without requiring a model.
+    Auxiliary worker that handles everything that the driver does.
     """
 
     def __init__(self, config, reward_fn, kl_ctrl):
@@ -838,20 +854,28 @@ class ReturnEstimatorWorker(Worker):
         # No model initialization needed
         pass
     
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_scores_and_advantage(self, data: DataProto):
+    # TODO: define a new dispatch mode for this
+    @register(dispatch_mode=Dispatch.ALL_TO_ALL)
+    def compute_scores_and_advantage(self, data1, data2, data3, data4):
         """
         Combines reward computation, KL penalty, and advantage estimation in one step
         """
-
+        data = DataProto.concat([data1, data2, data3, data4])
+        if DEBUG:
+            print(f"After concat - device: {data.batch.device}")
+        
         # Compute rewards
         reward_tensor = self.reward_fn(data)
         data.batch["token_level_scores"] = reward_tensor
+        if DEBUG:
+            print(f"After reward computation - device: {data.batch.device}")
 
         # Apply KL penalty
         data, kl_metrics = apply_kl_penalty(
             data, kl_ctrl=self.kl_ctrl, kl_penalty=self.config.algorithm.kl_penalty
         )
+        if DEBUG:
+            print(f"After KL penalty - device: {data.batch.device}")
 
         # Compute advantages
         data = compute_advantage(
@@ -860,11 +884,35 @@ class ReturnEstimatorWorker(Worker):
             lam=self.config.algorithm.lam,
             adv_estimator=self.config.algorithm.adv_estimator,
         )
+        if DEBUG:
+            print(f"After advantage computation - device: {data.batch.device}")
+        
+        data = DataProto.chunk(data, chunks=4)
+        if DEBUG:
+            print(f"After chunking - device: {data[0].batch.device}")
 
-        # Move results back to CPU
-        data = data.to("cpu")
+        return tuple(data)
+    
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def union(self, *args):
+        if DEBUG:
+            for arg in args:
+                if arg.batch is not None:
+                    print(f"device: {arg.batch.device}")
+        result = args[0]
+        for arg in args[1:]:
+            result = result.union(arg)
+        return result
+    
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def pop_gen_batch(self, data: DataProto):
+        if DEBUG:
+            print(f"pop_gen_batch input device: {data.batch.device}")
+        gen_batch = data.pop(
+             batch_keys=["input_ids", "attention_mask", "position_ids"]
+        )
+        return gen_batch, data
 
-        return data
     
     
 

@@ -37,4 +37,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=-1 \
     trainer.test_freq=10 \
     trainer.total_epochs=5 \
-    trainer.default_hdfs_dir=/mnt/local_storage/experiments/gsm8k/ppo/deepseek_llm_7b_function_rm
+    trainer.default_hdfs_dir=/mnt/local_storage/experiments/gsm8k/ppo/deepseek_llm_7b_function_rm \
+    trainer.use_rcg=True
