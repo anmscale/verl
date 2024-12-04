@@ -3,7 +3,7 @@ set -x
 python3 -m verl.trainer.main_ppo \
     data.train_files=/mnt/cluster_storage/data/gsm8k/train.parquet \
     data.val_files=/mnt/cluster_storage/data/gsm8k/test.parquet \
-    data.train_batch_size=256 \
+    data.train_batch_size=512 \
     data.val_batch_size=512 \
     data.max_prompt_length=512 \
     data.max_response_length=512 \

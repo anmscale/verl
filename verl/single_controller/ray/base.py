@@ -229,7 +229,6 @@ class RayWorkerGroup(WorkerGroup):
         self._world_size = world_size
         # cia.add_kwarg("_world_size", world_size)
         num_gpus = 1 / resource_pool.max_collocate_count
-
         rank = -1
         for pg_idx, local_world_size in enumerate(resource_pool.store):
             pg = pgs[pg_idx]
@@ -362,31 +361,31 @@ class RayWorkerGroup(WorkerGroup):
 
         return [getattr(worker, method_name).remote(*args, **kwargs) for worker in self._workers]
 
-    def bind_all(self, method_name: str, *args, num_returns=1, nccl=True):
+    def bind_all(self, method_name: str, *args, num_returns=1, nccl=False):
         # Mirror the logic in execute_all_async but with bind
         length = len(self._workers)
         results = [list() for _ in range(num_returns)]
-        
         for i in range(length):
             remote_fn = getattr(self._workers[i], method_name)
             sliced_args = tuple(arg[i] for arg in args)
             remote_result = remote_fn.options(num_returns=num_returns).bind(*sliced_args)
-                
+            # hack: skip nccl for rank 0
             if num_returns == 1:
-                results[0].append(remote_result.with_type_hint(TorchTensorType(transport="nccl")) if nccl else remote_result)
+                results[0].append(remote_result.with_type_hint(TorchTensorType(transport="nccl")) if nccl and i > 0 else remote_result)
             else:
                 for j in range(num_returns):
-                    results[j].append(remote_result[j].with_type_hint(TorchTensorType(transport="nccl")) if nccl else remote_result[j])
+                    results[j].append(remote_result[j].with_type_hint(TorchTensorType(transport="nccl")) if nccl and i > 0 else remote_result[j])
             
         return results if num_returns > 1 else results[0]
     
-    def bind_rank_zero(self, method_name: str, args, num_returns=1, nccl=True):
+    def bind_rank_zero(self, method_name: str, args, num_returns=1, nccl=False):
         remote_fn = getattr(self._workers[0], method_name)
         result = remote_fn.options(num_returns=num_returns).bind(*args)
         if num_returns == 1:
             return result.with_type_hint(TorchTensorType(transport="nccl")) if nccl else result
         else:
-            return [result[i].with_type_hint(TorchTensorType(transport="nccl")) if nccl else result[i] for i in range(num_returns)]
+            # hack: skip nccl for rank 0
+            return [result[i].with_type_hint(TorchTensorType(transport="nccl")) if nccl and i > 0 else result[i] for i in range(num_returns)]
 
     @property
     def master_address(self):
@@ -491,7 +490,7 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
     for key, user_defined_cls in cls_dict.items():
         user_defined_cls = _unwrap_ray_remote(user_defined_cls)
         _bind_workers_method_to_parent(WorkerDict, key, user_defined_cls)
-
     remote_cls = ray.remote(WorkerDict)
     remote_cls = RayClassWithInitArgs(cls=remote_cls)
+    
     return remote_cls
