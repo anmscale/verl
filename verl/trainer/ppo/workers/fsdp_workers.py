@@ -22,7 +22,7 @@ import ray
 import torch
 import torch.distributed
 from omegaconf import DictConfig, open_dict
-
+from typing import List
 from single_controller.base import Worker
 from single_controller.base.decorator import register, Dispatch
 import verl.utils.torch_functional as verl_F
@@ -33,8 +33,9 @@ from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils.fsdp_utils import get_fsdp_wrap_policy, load_fsdp_grad, offload_fsdp_grad, init_fn, get_init_weight_context_manager
 from verl.utils.fsdp_utils import offload_fsdp_optimizer, offload_fsdp_param_and_grad, load_fsdp_optimizer, load_fsdp_param_and_grad
 from verl.utils.import_utils import import_external_libs
-from verl.utils.debug import log_gpu_memory_usage
+from verl.utils.debug import log_gpu_memory_usage, log_cuda_time
 import verl.utils.hdfs_io as hdfs_io
+import time
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
@@ -310,6 +311,13 @@ class ActorRolloutRefWorker(Worker):
         if DEBUG:
             print(f"update_actor data device: {data.batch.device}")
         data = data.to('cuda')
+        data.batch = data.batch.cuda()
+        
+        # Start both timers
+        start_perf = time.perf_counter()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
 
         assert self._is_actor
         if self._is_offload_param:
@@ -318,8 +326,6 @@ class ActorRolloutRefWorker(Worker):
                                      load_grad=self._is_offload_grad)
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
-
-        data.batch = data.batch.cuda()
 
         log_gpu_memory_usage('Before update policy', logger=logger)
 
@@ -333,6 +339,7 @@ class ActorRolloutRefWorker(Worker):
 
         # TODO: here, we should return all metrics
         output = DataProto(meta_info={'metrics': metrics})
+        # move to cpu at group level
         # output = output.to('cpu')
 
         if self._is_offload_param:
@@ -340,11 +347,21 @@ class ActorRolloutRefWorker(Worker):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
         torch.cuda.empty_cache()
+        end.record()
+        log_cuda_time('update_actor', start, end, start_perf=start_perf, logger=logger)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         prompts = prompts.to('cuda')
+        prompts.batch = prompts.batch.cuda()
+        
+        # Start both timers
+        start_perf = time.perf_counter()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        
         # set to False if it is validation
         recompute_log_prob = prompts.meta_info.get('recompute_log_prob', True)
 
@@ -354,9 +371,8 @@ class ActorRolloutRefWorker(Worker):
                                      device_id=torch.cuda.current_device(),
                                      load_grad=self._is_offload_grad)
 
-        prompts.batch = prompts.batch.cuda()
         
-
+        
         meta_info = {'eos_token_id': self.tokenizer.eos_token_id, 'pad_token_id': self.tokenizer.pad_token_id}
         prompts.meta_info.update(meta_info)
         with self.sharding_manager:
@@ -372,7 +388,9 @@ class ActorRolloutRefWorker(Worker):
             output.meta_info['temperature'] = self.config.rollout.temperature
             old_log_probs = self.actor.compute_log_prob(data=output)
             output.batch['old_log_probs'] = old_log_probs
+
         output = output.to('cuda')
+        # move to cpu at group level
         # output = output.to('cpu')
         if DEBUG:
             print(f'generate_sequences output device: {output.batch.device}')
@@ -381,6 +399,9 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
         # clear kv cache
         torch.cuda.empty_cache()
+        end.record()
+
+        log_cuda_time('generate_sequences', start, end, start_perf=start_perf, logger=logger)
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
 
@@ -390,6 +411,15 @@ class ActorRolloutRefWorker(Worker):
         if DEBUG:
             print("data device ref_log_prob: ", data.batch.device)
         data = data.to('cuda')
+        data.batch = data.batch.cuda()
+        
+        # Start both timers
+        start_perf = time.perf_counter()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        
+        
 
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.ref_module_fsdp,
@@ -406,11 +436,15 @@ class ActorRolloutRefWorker(Worker):
         output = DataProto.from_dict(tensors={'ref_log_prob': ref_log_prob})
         if DEBUG:
             print(f'compute_ref_log_prob output device: {output.batch.device}')
+        # move to cpu at group level
         # output = output.to('cpu')
 
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.ref_module_fsdp, offload_grad=self._is_offload_grad)
         torch.cuda.empty_cache()
+        end.record()
+
+        log_cuda_time('compute_ref_log_prob', start, end, start_perf=start_perf, logger=logger)
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -586,7 +620,13 @@ class CriticWorker(Worker):
         if DEBUG:
             print("data device compute_values: ", data.batch.device)
         data = data.to('cuda')
-
+        data.batch = data.batch.cuda()
+        
+        start_perf = time.perf_counter()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.critic_module,
                                      device_id=torch.cuda.current_device(),
@@ -600,6 +640,7 @@ class CriticWorker(Worker):
         values = self.critic.compute_values(data=data)
         
         output = DataProto.from_dict(tensors={'values': values})
+        # move to cpu at group level
         # output = output.to('cpu')
         if DEBUG:
             print(f'compute_values output device: {output.batch.device}')
@@ -607,6 +648,9 @@ class CriticWorker(Worker):
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
         torch.cuda.empty_cache()
+        
+        end.record()
+        log_cuda_time('compute_values', start, end, start_perf=start_perf, logger=logger)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -614,6 +658,13 @@ class CriticWorker(Worker):
         if DEBUG:
             print(f"update_critic data device: {data.batch.device}")
         data = data.to('cuda')
+        data.batch = data.batch.cuda()
+        
+        start_perf = time.perf_counter()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.critic_module,
                                      device_id=torch.cuda.current_device(),
@@ -632,7 +683,10 @@ class CriticWorker(Worker):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
         torch.cuda.empty_cache()
+        # move to cpu at group level
         # output = output.to('cpu')
+        end.record()
+        log_cuda_time('update_critic', start, end, start_perf=start_perf, logger=logger)
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -829,6 +883,7 @@ class RewardModelWorker(Worker):
         token_level_scores = self._expand_to_token_level(data, scores)
         # Note that this is only the scores, may not be the final rewards used to train RL
         output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
+        # move to cpu at group level
         # output = output.to('cpu')
         torch.cuda.empty_cache()
         if DEBUG:
@@ -862,6 +917,12 @@ class AuxiliaryWorker(Worker):
         """
         Combines reward computation, KL penalty, and advantage estimation in one step
         """
+        # Start both timers
+        start_perf = time.perf_counter()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+
         data = DataProto.concat([data1, data2, data3, data4])
         if DEBUG:
             print(f"After concat - device: {data.batch.device}")
@@ -893,10 +954,18 @@ class AuxiliaryWorker(Worker):
         if DEBUG:
             print(f"After chunking - device: {data[0].batch.device}")
 
+        end.record()
+        log_cuda_time('compute_scores_and_advantage', start, end, start_perf=start_perf, logger=logger)
         return tuple(data)
     
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def union(self, *args):
+        # Start both timers
+        start_perf = time.perf_counter()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+
         if DEBUG:
             for arg in args:
                 if arg.batch is not None:
@@ -904,16 +973,9 @@ class AuxiliaryWorker(Worker):
         result = args[0]
         for arg in args[1:]:
             result = result.union(arg)
+        end.record()
+        log_cuda_time('union', start, end, start_perf=start_perf, logger=logger)
         return result
-    
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def pop_gen_batch(self, data: DataProto):
-        if DEBUG:
-            print(f"pop_gen_batch input device: {data.batch.device}")
-        gen_batch = data.pop(
-             batch_keys=["input_ids", "attention_mask", "position_ids"]
-        )
-        return gen_batch, data
 
     
     

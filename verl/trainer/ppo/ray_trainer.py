@@ -42,6 +42,7 @@ import copy
 import torch
 import random
 import numpy as np
+from verl.utils.debug.performance import log_data_size
 
 WorkerType = Type[Worker]
 
@@ -460,9 +461,11 @@ class RayPPOTrainer(object):
                     )
                     # generate a batch
                     with Timer(name="gen", logger=None) as timer:
+                        log_data_size('generate_sequences input', gen_batch)
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(
                             gen_batch
                         )
+                        log_data_size('generate_sequences output', gen_batch_output)
                     metrics["timing/gen"] = timer.last
                     
                     batch = batch.union(gen_batch_output)
@@ -471,15 +474,18 @@ class RayPPOTrainer(object):
                         with Timer(name="ref", logger=None) as timer:
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+                            log_data_size('compute_ref_log_prob', ref_log_prob)
                         metrics["timing/ref"] = timer.last
 
                     # compute values
                     with Timer(name="values", logger=None) as timer:
+                        log_data_size('compute_values input', batch)
                         values = self.critic_wg.compute_values(batch)
                         batch = batch.union(values)
+                        log_data_size('compute_values output', values)
                     metrics["timing/values"] = timer.last
                     
-
+                    
                     with Timer(name="adv", logger=None) as timer:
                         if self.use_rm:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
@@ -501,11 +507,13 @@ class RayPPOTrainer(object):
                             self.config.algorithm.lam,
                             adv_estimator=self.config.algorithm.adv_estimator,
                         )
+
                     metrics["timing/adv"] = timer.last
                     
                     # update critic
                     if self.use_critic:
                         with Timer(name="update_critic", logger=None) as timer:
+                            log_data_size('update_critic input', batch)
                             critic_output = self.critic_wg.update_critic(batch)
                         metrics["timing/update_critic"] = timer.last
                         critic_output_metrics = reduce_metrics(
@@ -516,13 +524,14 @@ class RayPPOTrainer(object):
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= global_steps:
                         with Timer(name="update_actor", logger=None) as timer:
+                            log_data_size('update_actor input', batch)
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         metrics["timing/update_actor"] = timer.last
                         actor_output_metrics = reduce_metrics(
                             actor_output.meta_info["metrics"]
                         )
                         metrics.update(actor_output_metrics)
-
+                
                 metrics["timing/full_step"] = full_timer.last
 
                 # validate
@@ -611,6 +620,8 @@ class RayCGPPOTrainer(RayPPOTrainer):
             self.auxiliary_wg.init_model()
         
         self._build_compiled_graph()
+        if debug:
+            breakpoint()
 
     def _build_compiled_graph(self):
         print("building compiled graph...")
