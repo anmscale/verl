@@ -44,11 +44,11 @@ python3 -m verl.trainer.main_ppo \
     reward_model.micro_batch_size=16 \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.critic_warmup=0 \
-    trainer.logger=['console','tracking'] \
+    trainer.logger=['console','wandb'] \
     trainer.project_name='verl_example' \
     trainer.experiment_name='Qwen2-7B-Instruct_hybrid_rm' \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
-    trainer.total_epochs=15
+    trainer.total_epochs=15 $@

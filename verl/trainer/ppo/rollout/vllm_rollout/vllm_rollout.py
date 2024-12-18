@@ -72,6 +72,8 @@ class vLLMRollout(BaseRollout):
             "disable CUDA graph (enforce_eager = False) if free cache engine"
 
         tensor_parallel_size = self.config.get('tensor_model_parallel_size', 1)
+        assert tensor_parallel_size <= torch.distributed.get_world_size(), \
+            "tensor parallel size should be less than or equal to the world size"
 
         if kwargs.get('train_tp', None) is not None:
             # deployed with megatron
@@ -80,7 +82,7 @@ class vLLMRollout(BaseRollout):
             os.environ['MEGATRON_IMPORT_TIMERS'] = '0'
             train_tp = kwargs.get('train_tp', None)
             num_tp_per_train_tp = train_tp // tensor_parallel_size
-            if vllm_version == '0.4.2' or vllm_version == '0.5.4':
+            if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
                 vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size,
                                                   num_tp_per_train_tp=num_tp_per_train_tp)
 
@@ -107,7 +109,7 @@ class vLLMRollout(BaseRollout):
         )
 
         # we may detokenize the result all together later
-        if vllm_version == '0.4.2' or vllm_version == '0.5.4':
+        if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
             kwargs['detokenize'] = False
 
         # supporting adding any sampling params from the config file
