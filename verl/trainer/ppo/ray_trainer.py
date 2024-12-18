@@ -31,7 +31,7 @@ from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClass
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl import DataProto
 from verl.trainer.ppo import core_algos
-from single_controller.ray.decorator import (
+from verl.single_controller.ray.decorator import (
     dispatch_dp_compute_data_proto,
     collect_dp_compute_data_proto,
 )
