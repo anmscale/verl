@@ -18,7 +18,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 from verl import DataProto
 import torch
 from verl.utils.reward_score import gsm8k, math
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, RayCGPPOTrainer
 
 
 def _select_rm_score_fn(data_source):
@@ -31,6 +31,8 @@ def _select_rm_score_fn(data_source):
 
 
 class RewardManager():
+    """The reward manager.
+    """
 
     def __init__(self, tokenizer, num_examine) -> None:
         self.tokenizer = tokenizer
@@ -92,7 +94,7 @@ import hydra
 def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN', 'RAY_ADAG_ENABLE_DETECT_DEADLOCK': '0'}})
 
     ray.get(main_task.remote(config))
 
@@ -112,19 +114,20 @@ def main_task(config):
     local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
 
     # instantiate tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(local_path)
+    from verl.utils import hf_tokenizer
+    tokenizer = hf_tokenizer(local_path)
 
     # define worker classes
     if config.actor_rollout_ref.actor.strategy == 'fsdp':
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-        from verl.trainer.ppo.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
-        from single_controller.ray import RayWorkerGroup
+        from verl.trainer.ppo.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker, AuxiliaryWorker
+        from verl.single_controller.ray import RayWorkerGroup
         ray_worker_group_cls = RayWorkerGroup
 
     elif config.actor_rollout_ref.actor.strategy == 'megatron':
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
         from verl.trainer.ppo.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
-        from single_controller.ray.megatron import NVMegatronRayWorkerGroup
+        from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
         ray_worker_group_cls = NVMegatronRayWorkerGroup
 
     else:
@@ -135,8 +138,10 @@ def main_task(config):
     role_worker_mapping = {
         Role.ActorRollout: ActorRolloutRefWorker,
         Role.Critic: CriticWorker,
-        Role.RefPolicy: ActorRolloutRefWorker
+        Role.RefPolicy: ActorRolloutRefWorker,
     }
+    if config.trainer.use_rcg:
+        role_worker_mapping[Role.AuxiliaryWorker] = AuxiliaryWorker
 
     global_pool_id = 'global_pool'
     resource_pool_spec = {
@@ -147,6 +152,8 @@ def main_task(config):
         Role.Critic: global_pool_id,
         Role.RefPolicy: global_pool_id,
     }
+    if config.trainer.use_rcg:
+        mapping[Role.AuxiliaryWorker] = global_pool_id
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score
@@ -171,13 +178,22 @@ def main_task(config):
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-    trainer = RayPPOTrainer(config=config,
-                            tokenizer=tokenizer,
-                            role_worker_mapping=role_worker_mapping,
-                            resource_pool_manager=resource_pool_manager,
-                            ray_worker_group_cls=ray_worker_group_cls,
-                            reward_fn=reward_fn,
-                            val_reward_fn=val_reward_fn)
+    if config.trainer.use_rcg:
+        trainer = RayCGPPOTrainer(config=config,
+                                 tokenizer=tokenizer,
+                                 role_worker_mapping=role_worker_mapping,
+                                 resource_pool_manager=resource_pool_manager,
+                                 ray_worker_group_cls=ray_worker_group_cls,
+                                 reward_fn=reward_fn,
+                                 val_reward_fn=val_reward_fn)
+    else:
+        trainer = RayPPOTrainer(config=config,
+                               tokenizer=tokenizer,
+                               role_worker_mapping=role_worker_mapping,
+                               resource_pool_manager=resource_pool_manager,
+                               ray_worker_group_cls=ray_worker_group_cls,
+                               reward_fn=reward_fn,
+                               val_reward_fn=val_reward_fn)
     trainer.init_workers()
     trainer.fit()
 

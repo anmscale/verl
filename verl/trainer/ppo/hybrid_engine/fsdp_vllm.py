@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 import os
 import logging
 import torch
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.api import ShardingStrategy, ShardedStateDictConfig, StateDictType
+from torch.distributed.fsdp.api import ShardingStrategy, ShardedStateDictConfig, StateDictType, FullStateDictConfig
 
 from verl.third_party.vllm import LLM
 from verl.third_party.vllm import parallel_state as vllm_ps
@@ -42,7 +43,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if full_params:
             FSDP.set_state_dict_type(self.module,
                                      state_dict_type=StateDictType.FULL_STATE_DICT,
-                                     state_dict_config=ShardedStateDictConfig())
+                                     state_dict_config=FullStateDictConfig())
         else:
             FSDP.set_state_dict_type(self.module,
                                      state_dict_type=StateDictType.SHARDED_STATE_DICT,
@@ -54,7 +55,12 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
         # Copy, not share memory
         load_format = 'hf' if self.full_params else 'dtensor'
+        
+        sync_start = time.perf_counter()
         self.inference_engine.sync_model_weights(params, load_format=load_format)
+        sync_duration = time.perf_counter() - sync_start
+        print(f"[Rank {torch.distributed.get_rank()}] Model weight sync took {sync_duration:.2f} seconds")
+        
         log_gpu_memory_usage('After sync model weights in sharding manager', logger=logger)
 
         del params

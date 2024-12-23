@@ -19,7 +19,7 @@ We can subclass Protocol to define more detailed batch info with specific keys
 import numpy as np
 import copy
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Union
+from typing import Callable, Dict, List, Union, Optional
 
 import torch
 import tensordict
@@ -36,8 +36,12 @@ except:
     pass
 
 
-def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> TensorDict:
+def union_tensor_dict(tensor_dict1: Optional[TensorDict], tensor_dict2: Optional[TensorDict]) -> TensorDict:
     """Union two tensordicts."""
+    if tensor_dict1 is None:
+        return tensor_dict2
+    if tensor_dict2 is None:
+        return tensor_dict1
     assert tensor_dict1.batch_size == tensor_dict2.batch_size, \
         f'Two tensor dict must have identical batch size. Got {tensor_dict1.batch_size} and {tensor_dict2.batch_size}'
     for key in tensor_dict2.keys():
@@ -122,7 +126,7 @@ class DataProto:
     def __getstate__(self):
         import io
         buffer = io.BytesIO()
-        if tensordict.__version__ >= '0.5.0' and self.batch is not None:
+        if tensordict.__version__ >= '0.5.0' and self.batch is not None and len(self.batch) > 0:
             self.batch = self.batch.contiguous()
             self.batch = self.batch.consolidate()
         torch.save(self.batch, buffer)
@@ -145,17 +149,18 @@ class DataProto:
         if self.batch is not None:
             assert len(self.batch.batch_size) == 1, 'only support num_batch_dims=1'
 
-        if len(self.non_tensor_batch) != 0:
-            # TODO: we can actually lift this restriction if needed
-            assert len(self.batch.batch_size) == 1, 'only support num_batch_dims=1 when non_tensor_batch is not empty.'
+        # Amjad: comment out for now
+        # if len(self.non_tensor_batch) != 0:
+        #     # TODO: we can actually lift this restriction if needed
+        #     assert len(self.batch.batch_size) == 1, 'only support num_batch_dims=1 when non_tensor_batch is not empty.'
 
-            batch_size = self.batch.batch_size[0]
-            for key, val in self.non_tensor_batch.items():
-                assert isinstance(
-                    val, np.ndarray
-                ) and val.dtype == object, 'data in the non_tensor_batch must be a numpy.array with dtype=object'
-                assert val.shape[
-                    0] == batch_size, f'key {key} length {len(val)} is not equal to batch size {batch_size}'
+        #     batch_size = self.batch.batch_size[0]
+        #     for key, val in self.non_tensor_batch.items():
+        #         assert isinstance(
+        #             val, np.ndarray
+        #         ) and val.dtype == object, 'data in the non_tensor_batch must be a numpy.array with dtype=object'
+        #         assert val.shape[
+        #             0] == batch_size, f'key {key} length {len(val)} is not equal to batch size {batch_size}'
 
     @classmethod
     def from_single_dict(cls, data: Dict[str, Union[torch.Tensor, np.ndarray]], meta_info=None):
@@ -193,19 +198,25 @@ class DataProto:
         # get and check batch size
         batch_size = None
         pivot_key = None
+        device = None
         for key, tensor in tensors.items():
             if batch_size is None:
                 batch_size = tensor.shape[:num_batch_dims]
                 pivot_key = key
+                device = tensor.device
             else:
                 current_batch = tensor.shape[:num_batch_dims]
                 assert batch_size == current_batch, \
                     f'Not all the tensor in tensors have the same batch size with batch_dims={num_batch_dims}. Got {pivot_key} has {batch_size}, {key} has {current_batch}'
+                # All tensors should be on the same device
+                assert tensor.device == device, \
+                    f'All tensors must be on the same device. Got {pivot_key} on {device}, {key} on {tensor.device}'
 
         for key, val in non_tensors.items():
             non_tensors[key] = np.array(val, dtype=object)
 
-        tensor_dict = TensorDict(source=tensors, batch_size=batch_size)
+        # Create TensorDict with explicit device placement
+        tensor_dict = TensorDict(source=tensors, batch_size=batch_size, device=device)
         return cls(batch=tensor_dict, non_tensor_batch=non_tensors, meta_info=meta_info)
 
     def to(self, device) -> 'DataProto':
