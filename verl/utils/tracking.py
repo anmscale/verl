@@ -38,6 +38,10 @@ class Tracking(object):
 
         if 'tracking' in default_backend or 'wandb' in default_backend:
             import wandb
+            import os
+            WANDB_API_KEY = os.environ.get('WANDB_API_KEY')
+
+            print(f"wandb api key: {WANDB_API_KEY}")
             wandb.init(project=project_name, name=experiment_name, config=config)
             self.logger['wandb'] = wandb
 

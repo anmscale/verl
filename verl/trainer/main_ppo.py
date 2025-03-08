@@ -18,6 +18,7 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
 import ray
 import hydra
+import os
 
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
@@ -28,7 +29,8 @@ def main(config):
 def run_ppo(config, compute_score=None):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        
+        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN', 'WANDB_API_KEY': os.environ.get('WANDB_API_KEY') }})
 
     ray.get(main_task.remote(config, compute_score))
 
