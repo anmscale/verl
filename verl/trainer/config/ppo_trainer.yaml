@@ -163,6 +163,7 @@ algorithm:
     kl_coef: 0.001
 
 trainer:
+  simple_mode: False
   balance_batch: True
   total_epochs: 30
   total_training_steps: null
