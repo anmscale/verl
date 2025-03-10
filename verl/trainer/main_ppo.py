@@ -18,7 +18,7 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
 import ray
 import hydra
-
+import os
 
 def get_custom_reward_fn(config):
     import importlib.util, os
@@ -57,13 +57,17 @@ def run_ppo(config) -> None:
 
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={
-            'env_vars': {
-                'TOKENIZERS_PARALLELISM': 'true',
-                'NCCL_DEBUG': 'WARN',
-                'VLLM_LOGGING_LEVEL': 'WARN'
+        print("WANDB_API_KEY", os.environ.get("WANDB_API_KEY"))
+        ray.init(
+            runtime_env={
+                "env_vars": {
+                    "TOKENIZERS_PARALLELISM": "true",
+                    "NCCL_DEBUG": "WARN",
+                    "WANDB_API_KEY": os.environ.get("WANDB_API_KEY"),
+                    'VLLM_LOGGING_LEVEL': 'WARN',
+                }
             }
-        })
+        )
 
     ray.get(main_task.remote(config))
 
