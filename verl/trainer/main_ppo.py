@@ -15,7 +15,7 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-
+from verl.trainer.ppo.ray_trainer_simple import RayPPOTrainerSimple
 import ray
 import hydra
 import os
@@ -126,7 +126,12 @@ def main_task(config, compute_score=None):
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-    trainer = RayPPOTrainer(config=config,
+    if config.trainer.simple_mode:
+        trainer_cls = RayPPOTrainerSimple
+    else:
+        trainer_cls = RayPPOTrainer
+
+    trainer = trainer_cls(config=config,
                             tokenizer=tokenizer,
                             processor=processor,
                             role_worker_mapping=role_worker_mapping,
@@ -134,6 +139,7 @@ def main_task(config, compute_score=None):
                             ray_worker_group_cls=ray_worker_group_cls,
                             reward_fn=reward_fn,
                             val_reward_fn=val_reward_fn)
+
     trainer.init_workers()
     trainer.fit()
 
