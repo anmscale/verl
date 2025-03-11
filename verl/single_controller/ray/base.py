@@ -22,6 +22,8 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy, Nod
 from ray.experimental.state.api import get_actor
 
 from verl.single_controller.base import WorkerGroup, ResourcePool, ClassWithInitArgs, Worker
+from ray.experimental.channel.torch_tensor_type import TorchTensorType
+
 
 __all__ = ['Worker']
 
@@ -182,17 +184,19 @@ class RayWorkerGroup(WorkerGroup):
                  name_prefix: str = None,
                  detached=False,
                  worker_names=None,
+                 worker_name_to_worker=None,
                  **kwargs) -> None:
         super().__init__(resource_pool=resource_pool, **kwargs)
         self.ray_cls_with_init = ray_cls_with_init
         self.name_prefix = get_random_string(length=6) if name_prefix is None else name_prefix
+        self._worker_name_to_worker = {} if worker_name_to_worker is None else worker_name_to_worker
 
         if worker_names is not None:
             assert self._is_init_with_detached_workers
             self._worker_names = worker_names
 
         if self._is_init_with_detached_workers:
-            self._init_with_detached_workers(worker_names=worker_names)
+            self._init_with_detached_workers(worker_names=worker_names, worker_name_to_worker=worker_name_to_worker)
         else:
             self._init_with_resource_pool(resource_pool=resource_pool,
                                           ray_cls_with_init=ray_cls_with_init,
@@ -206,8 +210,11 @@ class RayWorkerGroup(WorkerGroup):
         worker_state_dict = get_actor(worker._actor_id.hex())
         return worker_state_dict.get("state", "undefined") == "ALIVE" if worker_state_dict is not None else False
 
-    def _init_with_detached_workers(self, worker_names):
-        workers = [ray.get_actor(name=name) for name in worker_names]
+    def _init_with_detached_workers(self, worker_names, worker_name_to_worker):
+        workers = []
+        for name in worker_names:
+            assert name in worker_name_to_worker
+            workers.append(worker_name_to_worker[name])
         self._workers = workers
         self._world_size = len(worker_names)
 
@@ -222,7 +229,6 @@ class RayWorkerGroup(WorkerGroup):
         self._world_size = world_size
         # cia.add_kwarg("_world_size", world_size)
         num_gpus = 1 / resource_pool.max_collocate_count
-
         rank = -1
         for pg_idx, local_world_size in enumerate(resource_pool.store):
             pg = pgs[pg_idx]
@@ -262,6 +268,7 @@ class RayWorkerGroup(WorkerGroup):
                                            num_gpus=num_gpus)
                 self._workers.append(worker)
                 self._worker_names.append(name)
+                self._worker_name_to_worker[name] = worker
 
                 if rank == 0:
                     register_center_actor = None
@@ -282,11 +289,12 @@ class RayWorkerGroup(WorkerGroup):
         return self._worker_names
 
     @classmethod
-    def from_detached(cls, worker_names=None, ray_cls_with_init=None):
+    def from_detached(cls, worker_names=None, ray_cls_with_init=None, worker_name_to_worker=None):
         worker_group = cls(resource_pool=None,
                            ray_cls_with_init=ray_cls_with_init,
                            name_prefix=None,
-                           worker_names=worker_names)
+                           worker_names=worker_names,
+                           worker_name_to_worker=worker_name_to_worker)
         return worker_group
 
     def spawn(self, prefix_set):
@@ -310,14 +318,16 @@ class RayWorkerGroup(WorkerGroup):
         new_worker_group_dict = {}
         for prefix in prefix_set:
             new_worker_group = self.from_detached(worker_names=self._worker_names,
-                                                  ray_cls_with_init=self.ray_cls_with_init)
+                                                  ray_cls_with_init=self.ray_cls_with_init,
+                                                  worker_name_to_worker=self._worker_name_to_worker)
 
             _rebind_actor_methods(new_worker_group, prefix)
             new_worker_group_dict[prefix] = new_worker_group
         return new_worker_group_dict
 
     def execute_rank_zero_sync(self, method_name: str, *args, **kwargs):
-        return ray.get(self.execute_all_async(method_name, **args, **kwargs))
+        # Amjad: fixed bug
+        return ray.get(self.execute_rank_zero_async(method_name, *args, **kwargs))
 
     def execute_rank_zero_async(self, method_name: str, *args, **kwargs):
         remote_call = getattr(self._workers[0], method_name)
@@ -333,8 +343,9 @@ class RayWorkerGroup(WorkerGroup):
         return ray.get(self.execute_all_async(method_name, *args, **kwargs))
 
     def execute_all_async(self, method_name: str, *args, **kwargs):
-        # 这里我们假设，如果 args 和 kwargs 里面所有的参数都是 list，且所有的 list 长度都与 len(self._workers) 一致的话，我们会把
-        # list 中的每一个分别发到对应的 worker 上去
+        # Here we assume that if all parameters in args and kwargs are lists,
+        # and all lists have the same length as len(self._workers),
+        # we will distribute each element to its corresponding worker
         # print(f"execute_all_async: method {method_name}({args}, {kwargs})")
         length = len(self._workers)
         if all(isinstance(arg, list) for arg in args) and all(isinstance(kwarg, list) for kwarg in kwargs.values()):
@@ -349,6 +360,32 @@ class RayWorkerGroup(WorkerGroup):
                 return result
 
         return [getattr(worker, method_name).remote(*args, **kwargs) for worker in self._workers]
+
+    def bind_all(self, method_name: str, *args, num_returns=1, nccl=False):
+        # Mirror the logic in execute_all_async but with bind
+        length = len(self._workers)
+        results = [list() for _ in range(num_returns)]
+        for i in range(length):
+            remote_fn = getattr(self._workers[i], method_name)
+            sliced_args = tuple(arg[i] for arg in args)
+            remote_result = remote_fn.options(num_returns=num_returns).bind(*sliced_args)
+            # hack: skip nccl for rank 0
+            if num_returns == 1:
+                results[0].append(remote_result.with_type_hint(TorchTensorType(transport="nccl")) if nccl and i > 0 else remote_result)
+            else:
+                for j in range(num_returns):
+                    results[j].append(remote_result[j].with_type_hint(TorchTensorType(transport="nccl")) if nccl and i > 0 else remote_result[j])
+            
+        return results if num_returns > 1 else results[0]
+    
+    def bind_rank_zero(self, method_name: str, args, num_returns=1, nccl=False):
+        remote_fn = getattr(self._workers[0], method_name)
+        result = remote_fn.options(num_returns=num_returns).bind(*args)
+        if num_returns == 1:
+            return result.with_type_hint(TorchTensorType(transport="nccl")) if nccl else result
+        else:
+            # hack: skip nccl for rank 0
+            return [result[i].with_type_hint(TorchTensorType(transport="nccl")) if nccl and i > 0 else result[i] for i in range(num_returns)]
 
     @property
     def master_address(self):
@@ -453,7 +490,7 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
     for key, user_defined_cls in cls_dict.items():
         user_defined_cls = _unwrap_ray_remote(user_defined_cls)
         _bind_workers_method_to_parent(WorkerDict, key, user_defined_cls)
-
     remote_cls = ray.remote(WorkerDict)
     remote_cls = RayClassWithInitArgs(cls=remote_cls)
+    
     return remote_cls

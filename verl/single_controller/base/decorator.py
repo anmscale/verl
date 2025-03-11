@@ -286,12 +286,14 @@ def dispatch_dp_compute_data_proto_with_func(worker_group, *args, **kwargs):
     return splitted_args_with_func, splitted_kwargs
 
 
-def collect_dp_compute_data_proto(worker_group, output):
+def collect_dp_compute_data_proto(worker_group, output, to_cpu=True):
     from verl.protocol import DataProto
     import ray
 
     for o in output:
         assert isinstance(o, (DataProto, ray.ObjectRef)), f"expecting {o} to be DataProto, but got {type(o)}"
+        if isinstance(o, DataProto) and to_cpu:
+            o.to('cpu')
 
     output = collect_dp_compute(worker_group, output)
     return _concat_data_proto_or_future(output)

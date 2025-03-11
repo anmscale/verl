@@ -3,7 +3,7 @@ set -x
 python3 -m verl.trainer.main_ppo \
     data.train_files=/mnt/cluster_storage/data/gsm8k/train.parquet \
     data.val_files=/mnt/cluster_storage/data/gsm8k/test.parquet \
-    data.train_batch_size=512 \
+    data.train_batch_size=256 \
     data.val_batch_size=512 \
     data.max_prompt_length=512 \
     data.max_response_length=512 \
@@ -32,9 +32,11 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger=['console'] \
     trainer.project_name='verl_example_gsm8k' \
     trainer.experiment_name='deepseek_llm_7b_function_rm' \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
-    trainer.test_freq=10 \
+    trainer.test_freq=5 \
     trainer.total_epochs=5 \
-    trainer.default_hdfs_dir=/mnt/local_storage/experiments/gsm8k/ppo/deepseek_llm_7b_function_rm
+    trainer.default_hdfs_dir=/mnt/local_storage/experiments/gsm8k/ppo/deepseek_llm_7b_function_rm \
+    trainer.use_rcg=True
+

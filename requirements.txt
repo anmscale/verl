@@ -7,6 +7,6 @@ dill
 hydra-core
 numpy
 pybind11
-ray==2.10
+# ray==2.10
 tensordict
 transformers
