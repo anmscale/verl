@@ -24,7 +24,7 @@ import torch.distributed
 from torch.distributed.device_mesh import init_device_mesh
 import verl.utils.torch_functional as verl_F
 from omegaconf import DictConfig, open_dict
-from verl import DataProto
+from verl import DataProto, DataProtoFuture
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import register, Dispatch
 from verl.utils import hf_tokenizer, hf_processor
@@ -459,7 +459,7 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.empty_cache()
         return output
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False, materialize_futures=True)
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         prompts = prompts.to(torch.cuda.current_device())
@@ -502,7 +502,7 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
-
+        
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor

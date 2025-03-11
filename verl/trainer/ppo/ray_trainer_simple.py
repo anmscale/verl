@@ -22,10 +22,11 @@ from typing import Dict
 from codetiming import Timer
 from omegaconf import OmegaConf
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProtoFuture
 from verl.trainer.ppo.ray_trainer import (
     Role, AdvantageEstimator, ResourcePoolManager, RayPPOTrainer
 )
+import ray
 
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
@@ -39,9 +40,12 @@ class RayPPOTrainerSimple(RayPPOTrainer):
     Simplified version of RayPPOTrainer focusing only on the generation step
     """
 
-    def fit(self):
+    def fit(self, use_future=True):
         """
         Simplified training loop that only focuses on generation using DataProto
+        
+        Args:
+            use_future (bool): Whether to use DataProtoFuture for asynchronous execution
         """
         from verl.utils.tracking import Tracking
 
@@ -50,7 +54,7 @@ class RayPPOTrainerSimple(RayPPOTrainer):
                           default_backend=self.config.trainer.logger,
                           config=OmegaConf.to_container(self.config, resolve=True))
 
-        print("Starting simplified training loop")
+        print(f"Starting simplified training loop with {'DataProtoFuture' if use_future else 'DataProto'}")
         
         # Process a single batch
         for batch_dict in self.train_dataloader:
@@ -72,17 +76,31 @@ class RayPPOTrainerSimple(RayPPOTrainer):
                     non_tensor_batch_keys=['raw_prompt_ids'],
                 )
             
-            # Pad to be divisible by dp_size
-            gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, self.actor_rollout_wg.world_size)
-            
             with _timer('generation', timing_raw):
                 print("Starting generation...")
                 
-                # Use the existing DataProto approach
-                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_padded)
-                
-                # Unpad the results
-                gen_batch_output = unpad_dataproto(gen_batch_output, pad_size=pad_size)
+                if use_future:
+                    # Simply put the entire DataProto in Ray's object store
+                    future = ray.put(gen_batch)
+                    
+                    # Create a DataProtoFuture with a single future
+                    # The worker group will handle the chunking internally
+                    gen_batch_future = DataProtoFuture(
+                        collect_fn=lambda x: x[0],  # Just return the first (and only) element
+                        futures=[future]
+                    )
+                    # Use DataProtoFuture for asynchronous execution
+                    gen_batch_output_future = self.actor_rollout_wg.generate_sequences(gen_batch_future)
+                    
+                    # We can do other work here while generation is happening asynchronously
+                    print("Generation is running asynchronously...")
+                    breakpoint()
+                    
+                    # When we need the results, we call get()
+                    gen_batch_output = gen_batch_output_future.get()
+                else:
+                    # Original approach using DataProto directly
+                    gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                 
                 print("Generation completed!")
             
