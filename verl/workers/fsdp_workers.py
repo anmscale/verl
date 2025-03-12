@@ -459,9 +459,8 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.empty_cache()
         return output
 
-    @register(dispatch_mode=Dispatch.DP_FUTURE_1_N, blocking=False, materialize_futures=True)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False, materialize_futures=True)
     def generate_sequences(self, prompts: DataProto):
-        print("generate_sequences:", prompts.batch.batch_size)
         # Support all hardwares
         prompts = prompts.to(torch.cuda.current_device())
 
@@ -496,15 +495,16 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage('After rollout generation', logger=logger)
 
             output = self.rollout_sharding_manager.postprocess_data(output)
+
         output = output.to('cpu')
+
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
         
-    @register(dispatch_mode=Dispatch.DP_FUTURE_N_N, blocking=False, materialize_futures=True)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
-        print("compute_log_prob:", data.batch.batch_size)
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)

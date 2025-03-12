@@ -92,17 +92,15 @@ class RayPPOTrainerSimple(RayPPOTrainer):
                     # Use DataProtoFuture for asynchronous execution
                     gen_batch_output_future = self.actor_rollout_wg.generate_sequences(gen_batch_future)
                     
-                    old_log_prob_future = self.actor_rollout_wg.compute_log_prob(gen_batch_output_future)
-                    
-                    # When we need the results, we call get()
-                    old_log_prob = old_log_prob_future.get()
-                    gen_batch_output = gen_batch_output_future.get()
+                    # We can do other work here while generation is happening asynchronously
+                    print("Generation is running asynchronously...")
                     breakpoint()
                     
+                    # When we need the results, we call get()
+                    gen_batch_output = gen_batch_output_future.get()
                 else:
                     # Original approach using DataProto directly
                     gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                    
                 
                 print("Generation completed!")
             
