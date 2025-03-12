@@ -635,6 +635,14 @@ class DataProtoFuture:
                                          futures=self.futures)
             arg_future_lst.append(arg_future)
         return arg_future_lst
+    
+    # def split(self, chunks: int) -> List['DataProtoFuture']:
+    #     from functools import partial
+
+    #     arg_future_lst = []
+        
+            
+        
 
     def get(self):
         output = ray.get(self.futures)  # dp_size.

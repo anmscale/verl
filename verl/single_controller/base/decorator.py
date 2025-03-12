@@ -35,6 +35,8 @@ class Dispatch(Enum):
     DP_COMPUTE_PROTO = 9
     DP_COMPUTE_PROTO_WITH_FUNC = 10
     DP_COMPUTE_METRIC = 11
+    DP_FUTURE_1_N = 12
+    DP_FUTURE_N_N = 13
 
 
 class Execute(Enum):
@@ -55,7 +57,6 @@ def _split_args_kwargs_data_proto(chunks, *args, **kwargs):
         splitted_kwargs[key] = val.chunk(chunks=chunks)
 
     return splitted_args, splitted_kwargs
-
 
 def dispatch_one_to_all(worker_group, *args, **kwargs):
     args = tuple([arg] * worker_group.world_size for arg in args)
@@ -275,7 +276,16 @@ def dispatch_dp_compute_data_proto(worker_group, *args, **kwargs):
     splitted_args, splitted_kwargs = _split_args_kwargs_data_proto(worker_group.world_size, *args, **kwargs)
     return splitted_args, splitted_kwargs
 
+def dispatch_dp_future_1_n(worker_group, *args, **kwargs):
+    res = dispatch_dp_compute_data_proto(worker_group, *args, **kwargs)
+    return res
 
+def dispatch_dp_future_n_n(worker_group, *args, **kwargs):
+    # TODO: change this
+    res = dispatch_dp_compute_data_proto(worker_group, *args, **kwargs)
+    return res
+    
+    
 def dispatch_dp_compute_data_proto_with_func(worker_group, *args, **kwargs):
     from verl.single_controller.base.worker_group import WorkerGroup
     assert isinstance(worker_group, WorkerGroup)
@@ -342,6 +352,14 @@ def get_predefined_dispatch_fn(dispatch_mode):
         Dispatch.DP_COMPUTE_METRIC: {
             'dispatch_fn': dispatch_dp_compute_data_proto,
             'collect_fn': collect_dp_compute
+        },
+        Dispatch.DP_FUTURE_1_N: {
+            'dispatch_fn': dispatch_dp_future_1_n,
+            'collect_fn': collect_dp_compute_data_proto,
+        },
+        Dispatch.DP_FUTURE_N_N: {
+            'dispatch_fn': dispatch_dp_future_n_n,
+            'collect_fn': collect_dp_compute_data_proto
         }
     }
     return predefined_dispatch_mode_fn[dispatch_mode]
@@ -408,3 +426,4 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocki
         return inner
 
     return decorator
+
