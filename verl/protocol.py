@@ -637,6 +637,18 @@ class DataProtoFuture:
         return arg_future_lst
 
     def get(self):
+        # Track if this is being called from driver or actor
+        from ray.air._internal import torch_utils
+        device = torch_utils.get_devices()[0]
+        caller_type = "driver" if device.type == 'cpu' else "actor"
+        
+        # Get collect and dispatch function names
+        collect_fn_name = getattr(self.collect_fn, "__name__", str(self.collect_fn))
+        dispatch_fn_name = getattr(self.dispatch_fn, "__name__", str(self.dispatch_fn)) if self.dispatch_fn else "None"
+        
+        print(f"DataProtoFuture.get() called from {caller_type} | collect_fn: {collect_fn_name} | dispatch_fn: {dispatch_fn_name}")
+        
+        # Original implementation
         output = ray.get(self.futures)  # dp_size.
         for o in output:
             assert isinstance(o, DataProto)
@@ -662,3 +674,66 @@ def all_gather_data_proto(data: DataProto, process_group):
     all_non_tensor_batch = [None for _ in range(group_size)]
     torch.distributed.all_gather_object(all_non_tensor_batch, data.non_tensor_batch, group=process_group)
     data.non_tensor_batch = {k: np.concatenate([d[k] for d in all_non_tensor_batch]) for k in data.non_tensor_batch}
+
+
+def all_gather_data_proto_copy(data: DataProto, process_group):
+    """
+    Gather DataProto objects from all processes in the group and return a new combined DataProto
+    without modifying the original data.
+    
+    Args:
+        data (DataProto): The local DataProto object
+        process_group: The process group for the all_gather operation
+        
+    Returns:
+        DataProto: A new DataProto containing the gathered data from all processes
+    """
+    group_size = torch.distributed.get_world_size(group=process_group)
+    assert isinstance(data, DataProto)
+    
+    # Create new TensorDict for the gathered batch (don't modify original)
+    if data.batch is not None:
+        # Move to current CUDA device for gathering, then back
+        device = torch.cuda.current_device()
+        batch_cuda = data.batch.to(device, non_blocking=True)
+        
+        # Use allgather_dict_tensors to combine tensors across processes
+        gathered_batch = allgather_dict_tensors(
+            batch_cuda.contiguous(), 
+            size=group_size, 
+            group=process_group, 
+            dim=0
+        )
+        
+        # Move back to original device if needed
+        if data.batch.device != device:
+            gathered_batch = gathered_batch.to(data.batch.device)
+    else:
+        gathered_batch = None
+    
+    # Handle non-tensor batch data
+    gathered_non_tensor_batch = {}
+    if data.non_tensor_batch:
+        # Gather non-tensor batch data without modifying original
+        all_non_tensor_batch = [None for _ in range(group_size)]
+        torch.distributed.all_gather_object(
+            all_non_tensor_batch, 
+            data.non_tensor_batch, 
+            group=process_group
+        )
+        
+        # Create a new dictionary by concatenating arrays
+        for key in data.non_tensor_batch:
+            arrays = [d[key] for d in all_non_tensor_batch if key in d]
+            if arrays:
+                gathered_non_tensor_batch[key] = np.concatenate(arrays)
+    
+    # Create a new meta_info (shallow copy is fine for this)
+    meta_info = {} if data.meta_info is None else dict(data.meta_info)
+    
+    # Return a new DataProto instance
+    return DataProto(
+        batch=gathered_batch,
+        non_tensor_batch=gathered_non_tensor_batch,
+        meta_info=meta_info
+    )

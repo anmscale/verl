@@ -24,7 +24,7 @@ from verl.third_party.vllm import LLM
 from verl.third_party.vllm import parallel_state as vllm_ps
 from verl import DataProto
 from verl.utils.torch_functional import (broadcast_dict_tensor, allgather_dict_tensors)
-from verl.protocol import all_gather_data_proto
+from verl.protocol import all_gather_data_proto, all_gather_data_proto_copy
 from verl.utils.debug import log_gpu_memory_usage
 from verl.third_party.vllm import vllm_version
 
@@ -135,7 +135,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         else:
             group = vllm_ps.get_tensor_model_parallel_group().device_group
 
-        all_gather_data_proto(data=data, process_group=group)
+        data = all_gather_data_proto_copy(data=data, process_group=group)
         return data
 
     def postprocess_data(self, data: DataProto) -> DataProto:

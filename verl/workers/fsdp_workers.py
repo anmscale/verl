@@ -343,6 +343,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        # print_debug_info('init_model')
         from verl.workers.actor import DataParallelPPOActor
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get('external_lib', None))
@@ -414,7 +415,7 @@ class ActorRolloutRefWorker(Worker):
 
         torch.cuda.empty_cache()
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
     def update_actor(self, data: DataProto):
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
@@ -435,10 +436,12 @@ class ActorRolloutRefWorker(Worker):
             # perform training
             with Timer(name='update_policy', logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
-            delta_time = timer.last
-            global_num_tokens = data.meta_info['global_token_num']
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            #TODO: find a solution to compute flops, maybe exchange data here between workers
+            # delta_time = timer.last
+            
+            # global_num_tokens = data.meta_info['global_token_num']
+            # estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            # metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
 
             self.actor_lr_scheduler.step()
             lr = self.actor_lr_scheduler.get_last_lr()[0]
@@ -459,8 +462,9 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.empty_cache()
         return output
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False, materialize_futures=True)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
     def generate_sequences(self, prompts: DataProto):
+        # print_debug_info('generate_sequences')
         # Support all hardwares
         prompts = prompts.to(torch.cuda.current_device())
 
@@ -488,14 +492,16 @@ class ActorRolloutRefWorker(Worker):
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
-
-            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
+            prompts_full = self.rollout_sharding_manager.preprocess_data(prompts)
+            output = self.rollout.generate_sequences(prompts=prompts_full)
 
             log_gpu_memory_usage('After rollout generation', logger=logger)
 
             output = self.rollout_sharding_manager.postprocess_data(output)
 
+        # override the prompts tensordict with the output tensordict (instead of using union)
+        prompts.batch.update(output.batch)
+        output = prompts
         output = output.to('cpu')
 
         # clear kv cache
@@ -503,8 +509,9 @@ class ActorRolloutRefWorker(Worker):
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
         
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
     def compute_log_prob(self, data: DataProto):
+        # print_debug_info('compute_log_prob')
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -524,6 +531,8 @@ class ActorRolloutRefWorker(Worker):
                                          meta_info={'temperature': self.config.rollout.temperature})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
+        # adding union to the worker function
+        output = output.union(data)
         output = output.to('cpu')
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
@@ -539,8 +548,9 @@ class ActorRolloutRefWorker(Worker):
         log_gpu_memory_usage('After compute_log_prob', logger=logger)
         return output
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
     def compute_ref_log_prob(self, data: DataProto):
+        # print_debug_info('compute_ref_log_prob')
         assert self._is_ref
 
         # Support all hardwares
@@ -557,6 +567,8 @@ class ActorRolloutRefWorker(Worker):
             output = DataProto.from_dict(tensors={'ref_log_prob': output})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
+        # adding union to the worker function
+        output = output.union(data)
         output = output.to('cpu')
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
@@ -762,6 +774,7 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        # print_debug_info('init_model')
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get('external_lib', None))
 
@@ -787,9 +800,9 @@ class CriticWorker(Worker):
 
         torch.cuda.empty_cache()
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
     def compute_values(self, data: DataProto):
-
+        # print_debug_info('compute_values')
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
 
@@ -806,12 +819,14 @@ class CriticWorker(Worker):
             output = DataProto.from_dict(tensors={'values': values})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
+        # adding union to the worker function
+        output = output.union(data)
         output = output.to('cpu')
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
         return output
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
     def update_critic(self, data: DataProto):
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
@@ -826,11 +841,12 @@ class CriticWorker(Worker):
 
             with Timer(name='update_critic', logger=None) as timer:
                 metrics = self.critic.update_critic(data=data)
-            delta_time = timer.last
+            #TODO: find a solution to compute flops, maybe exchange data here between workers
+            # delta_time = timer.last
 
-            global_num_tokens = data.meta_info['global_token_num']
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics['mfu/critic'] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
+            # global_num_tokens = data.meta_info['global_token_num']
+            # estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            # metrics['mfu/critic'] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
 
             self.critic_lr_scheduler.step()
             lr = self.critic_lr_scheduler.get_last_lr()[0]
@@ -1156,3 +1172,77 @@ class RewardModelWorker(Worker):
         output = output.to('cpu')
         torch.cuda.empty_cache()
         return output
+
+
+class ScoringWorker(Worker):
+    """
+    Auxiliary worker that handles reward function, KL penalty, and advantage estimation.
+    """
+
+    def __init__(self, config, reward_fn, kl_ctrl):
+        super().__init__()
+        import torch.distributed
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        self.config = config
+        self.reward_fn = reward_fn
+        self.kl_ctrl = kl_ctrl
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        # No model initialization needed
+        pass
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    def compute_token_level_scores(self, data: DataProto):
+        from verl.trainer.ppo.ray_trainer import apply_kl_penalty
+        
+        data = data.to('cpu')
+        # Compute rewards
+        reward_tensor = self.reward_fn(data)
+        data.batch["token_level_scores"] = reward_tensor
+        
+        # Apply KL penalty if reference policy is used and not using KL loss
+        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+            data, kl_metrics = apply_kl_penalty(data,
+                                                kl_ctrl=self.kl_ctrl,
+                                                kl_penalty=self.config.algorithm.kl_penalty)
+            data.meta_info['metrics'] = kl_metrics
+        else:
+            data.batch['token_level_rewards'] = data.batch['token_level_scores']
+        
+        return data
+
+    
+    # Consider to do this on rank 0 only...
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    def compute_advantages(self, data: DataProto):
+        pass
+        # from verl.protocol import all_gather_data_proto_copy
+        # from verl.trainer.ppo.ray_trainer import compute_advantage
+        # # move data to GPU and exchange data with other workers
+        # data = data.to(torch.cuda.current_device())
+        # data = all_gather_data_proto_copy(data.batch, size=self.world_size, group=self.process_group)
+        
+        # # Compute advantages
+        # data = compute_advantage(
+        #     data,
+        #     gamma=self.algorithm_config.gamma,
+        #     lam=self.algorithm_config.lam,
+        #     adv_estimator=self.algorithm_config.adv_estimator,
+        # )
+
+def print_debug_info(method_name):
+    """Print debug information including class name, rank, process ID and Ray actor ID."""
+    import os
+    import ray
+    import inspect
+    
+    # Get the calling class name
+    frame = inspect.currentframe().f_back
+    class_name = frame.f_locals.get('self').__class__.__name__
+    
+    # Get rank from the instance
+    rank = frame.f_locals.get('self').rank
+    
+    print(f"{class_name}.{method_name} Rank: {rank}, PID: {os.getpid()}, RayID: {ray.get_runtime_context().get_actor_id()}")

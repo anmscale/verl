@@ -81,7 +81,7 @@ def main_task(config, compute_score=None):
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
         Role.Critic: ray.remote(CriticWorker),
-        # Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
+        Role.RefPolicy: ray.remote(ActorRolloutRefWorker),
     }
     global_pool_id = 'global_pool'
     resource_pool_spec = {
@@ -90,8 +90,14 @@ def main_task(config, compute_score=None):
     mapping = {
         Role.ActorRollout: global_pool_id,
         Role.Critic: global_pool_id,
-        # Role.RefPolicy: global_pool_id,
+        Role.RefPolicy: global_pool_id,
     }
+    
+    if config.trainer.simple_mode:
+        assert config.actor_rollout_ref.actor.strategy == 'fsdp'
+        from verl.workers.fsdp_workers import ScoringWorker
+        role_worker_mapping[Role.Scoring] = ray.remote(ScoringWorker)
+        mapping[Role.Scoring] = global_pool_id
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score
