@@ -34,11 +34,15 @@ def get_random_string(length: int) -> str:
 
 
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
-
     def func(*args, **kwargs):
+        should_materialize = blocking
+        # Override with kwargs if specified
+        if "blocking" in kwargs:
+            should_materialize = kwargs.pop("blocking")
+            
         args, kwargs = dispatch_fn(self, *args, **kwargs)
         output = execute_fn(method_name, *args, **kwargs)
-        if blocking:
+        if should_materialize:
             output = ray.get(output)
         output = collect_fn(self, output)
         return output

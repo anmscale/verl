@@ -15,10 +15,10 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-
+from verl.trainer.ppo.ray_trainer_simple import RayPPOTrainerSimple
 import ray
 import hydra
-
+import os
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
 def main(config):
@@ -28,7 +28,17 @@ def main(config):
 def run_ppo(config, compute_score=None):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        print("WANDB_API_KEY", os.environ.get("WANDB_API_KEY"))
+        ray.init(
+            runtime_env={
+                "env_vars": {
+                    "TOKENIZERS_PARALLELISM": "true",
+                    "NCCL_DEBUG": "WARN",
+                    "WANDB_API_KEY": os.environ.get("WANDB_API_KEY"),
+                    "CUDA_LAUNCH_BLOCKING": "1",
+                }
+            }
+        )
 
     ray.get(main_task.remote(config, compute_score))
 
@@ -71,9 +81,8 @@ def main_task(config, compute_score=None):
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
         Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
+        Role.RefPolicy: ray.remote(ActorRolloutRefWorker),
     }
-
     global_pool_id = 'global_pool'
     resource_pool_spec = {
         global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
@@ -83,6 +92,12 @@ def main_task(config, compute_score=None):
         Role.Critic: global_pool_id,
         Role.RefPolicy: global_pool_id,
     }
+    
+    if config.trainer.simple_mode:
+        assert config.actor_rollout_ref.actor.strategy == 'fsdp'
+        from verl.workers.fsdp_workers import ScoringWorker
+        role_worker_mapping[Role.Scoring] = ray.remote(ScoringWorker)
+        mapping[Role.Scoring] = global_pool_id
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score
@@ -116,7 +131,12 @@ def main_task(config, compute_score=None):
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-    trainer = RayPPOTrainer(config=config,
+    if config.trainer.simple_mode:
+        trainer_cls = RayPPOTrainerSimple
+    else:
+        trainer_cls = RayPPOTrainer
+
+    trainer = trainer_cls(config=config,
                             tokenizer=tokenizer,
                             processor=processor,
                             role_worker_mapping=role_worker_mapping,
@@ -124,6 +144,7 @@ def main_task(config, compute_score=None):
                             ray_worker_group_cls=ray_worker_group_cls,
                             reward_fn=reward_fn,
                             val_reward_fn=val_reward_fn)
+
     trainer.init_workers()
     trainer.fit()
 
