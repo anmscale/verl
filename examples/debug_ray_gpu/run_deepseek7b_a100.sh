@@ -1,12 +1,14 @@
 set -x
 
+
 export WANDB_PROJECT=$PROJECT_NAME
 export WANDB_API_KEY='34b8f32abb7ba71277361c99f84d9bea484b5d3b'
 
 python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
     data.train_files=/mnt/cluster_storage/data/gsm8k/train.parquet \
     data.val_files=/mnt/cluster_storage/data/gsm8k/test.parquet \
-    data.train_batch_size=16 \
+    data.train_batch_size=8 \
     data.max_prompt_length=196 \
     data.max_response_length=64 \
     data.filter_overlong_prompts=True \
@@ -33,7 +35,6 @@ python3 -m verl.trainer.main_ppo \
     critic.model.fsdp_config.param_offload=False \
     critic.model.fsdp_config.optimizer_offload=False \
     algorithm.kl_ctrl.kl_coef=0.001 \
-    trainer.simple_mode=True \
     trainer.critic_warmup=0 \
     trainer.logger=['console'] \
     trainer.project_name='verl_ray_gpu' \
