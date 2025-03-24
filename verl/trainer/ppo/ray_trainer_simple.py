@@ -95,7 +95,7 @@ class RayPPOTrainerSimple(RayPPOTrainer):
                                                         dtype=object)
             with _timer('step', timing_raw):
                 # Generate sequences
-                batch = self.actor_rollout_wg.generate_sequences(batch)
+                batch = self.actor_rollout_wg.generate_sequences(batch, blocking=False)
                 assert isinstance(batch, DataProtoFuture)
                 
                 # # Repeat to align with repeated responses in rollout (if needed)
@@ -108,21 +108,21 @@ class RayPPOTrainerSimple(RayPPOTrainer):
                 # batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
                 
                 # Compute log probabilities for the generated sequences
-                batch = self.actor_rollout_wg.compute_log_prob(batch)
+                batch = self.actor_rollout_wg.compute_log_prob(batch, blocking=False)
                 assert isinstance(batch, DataProtoFuture)
                 
                 # Compute reference policy log probabilities if available
                 if self.use_reference_policy:
-                    batch = self.ref_policy_wg.compute_ref_log_prob(batch)
+                    batch = self.ref_policy_wg.compute_ref_log_prob(batch, blocking=False)
                     assert isinstance(batch, DataProtoFuture)
                     
                 # Compute values if using critic
                 if self.use_critic:
-                    batch = self.critic_wg.compute_values(batch)
+                    batch = self.critic_wg.compute_values(batch, blocking=False)
                     assert isinstance(batch, DataProtoFuture)
 
                 # Compute reward scores
-                batch = self.scoring_wg.compute_token_level_scores(batch)
+                batch = self.scoring_wg.compute_token_level_scores(batch, blocking=False)
                 assert isinstance(batch, DataProtoFuture)
                 
                 # Compute advantages
@@ -137,12 +137,12 @@ class RayPPOTrainerSimple(RayPPOTrainer):
                 
                 # Update critic if using critic
                 if self.use_critic:
-                    critic_output = self.critic_wg.update_critic(batch)
+                    critic_output = self.critic_wg.update_critic(batch, blocking=False)
                     assert isinstance(critic_output, DataProtoFuture)
                     training_output.append(critic_output)
                 
                 # Update actor
-                actor_output = self.actor_rollout_wg.update_actor(batch)
+                actor_output = self.actor_rollout_wg.update_actor(batch, blocking=False)
                 assert isinstance(actor_output, DataProtoFuture)
                 training_output.append(actor_output)
                 

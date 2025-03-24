@@ -415,7 +415,7 @@ class ActorRolloutRefWorker(Worker):
 
         torch.cuda.empty_cache()
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
@@ -462,7 +462,7 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.empty_cache()
         return output
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         # print_debug_info('generate_sequences')
         # Support all hardwares
@@ -509,7 +509,7 @@ class ActorRolloutRefWorker(Worker):
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
         
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
         # print_debug_info('compute_log_prob')
         assert self._is_actor
@@ -548,7 +548,7 @@ class ActorRolloutRefWorker(Worker):
         log_gpu_memory_usage('After compute_log_prob', logger=logger)
         return output
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
         # print_debug_info('compute_ref_log_prob')
         assert self._is_ref
@@ -800,7 +800,7 @@ class CriticWorker(Worker):
 
         torch.cuda.empty_cache()
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_values(self, data: DataProto):
         # print_debug_info('compute_values')
         # Support all hardwares
@@ -826,7 +826,7 @@ class CriticWorker(Worker):
             offload_fsdp_model_to_cpu(self.critic_module)
         return output
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_critic(self, data: DataProto):
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
@@ -1193,7 +1193,7 @@ class ScoringWorker(Worker):
         # No model initialization needed
         pass
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_token_level_scores(self, data: DataProto):
         from verl.trainer.ppo.ray_trainer import apply_kl_penalty
         
@@ -1215,7 +1215,7 @@ class ScoringWorker(Worker):
 
     
     # Consider to do this on rank 0 only...
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_advantages(self, data: DataProto):
         pass
         # from verl.protocol import all_gather_data_proto_copy
