@@ -637,16 +637,16 @@ class DataProtoFuture:
         return arg_future_lst
 
     def get(self):
-        # Track if this is being called from driver or actor
-        from ray.air._internal import torch_utils
-        device = torch_utils.get_devices()[0]
-        caller_type = "driver" if device.type == 'cpu' else "actor"
+        # # Track if this is being called from driver or actor
+        # from ray.air._internal import torch_utils
+        # device = torch_utils.get_devices()[0]
+        # caller_type = "driver" if device.type == 'cpu' else "actor"
         
-        # Get collect and dispatch function names
-        collect_fn_name = getattr(self.collect_fn, "__name__", str(self.collect_fn))
-        dispatch_fn_name = getattr(self.dispatch_fn, "__name__", str(self.dispatch_fn)) if self.dispatch_fn else "None"
+        # # Get collect and dispatch function names
+        # collect_fn_name = getattr(self.collect_fn, "__name__", str(self.collect_fn))
+        # dispatch_fn_name = getattr(self.dispatch_fn, "__name__", str(self.dispatch_fn)) if self.dispatch_fn else "None"
         
-        print(f"DataProtoFuture.get() called from {caller_type} | collect_fn: {collect_fn_name} | dispatch_fn: {dispatch_fn_name}")
+        # print(f"DataProtoFuture.get() called from {caller_type} | collect_fn: {collect_fn_name} | dispatch_fn: {dispatch_fn_name}")
         
         # Original implementation
         output = ray.get(self.futures)  # dp_size.

@@ -436,9 +436,8 @@ class ActorRolloutRefWorker(Worker):
             # perform training
             with Timer(name='update_policy', logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
-            #TODO: find a solution to compute flops, maybe exchange data here between workers
+
             # delta_time = timer.last
-            
             # global_num_tokens = data.meta_info['global_token_num']
             # estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
             # metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
@@ -503,6 +502,9 @@ class ActorRolloutRefWorker(Worker):
         prompts.batch.update(output.batch)
         output = prompts
         output = output.to('cpu')
+        
+        # # compute local valid tokens
+        # output.non_tensor_batch['local_token_num'] = torch.sum(output.batch['attention_mask'], dim=-1).numpy()
 
         # clear kv cache
         torch.cuda.empty_cache()
@@ -841,9 +843,8 @@ class CriticWorker(Worker):
 
             with Timer(name='update_critic', logger=None) as timer:
                 metrics = self.critic.update_critic(data=data)
-            #TODO: find a solution to compute flops, maybe exchange data here between workers
+            
             # delta_time = timer.last
-
             # global_num_tokens = data.meta_info['global_token_num']
             # estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
             # metrics['mfu/critic'] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
