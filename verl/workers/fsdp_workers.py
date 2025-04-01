@@ -139,6 +139,8 @@ class ActorRolloutRefWorker(Worker):
                                                            self.ulysses_sequence_parallel_size)
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
+        self.peak_gpu_memory = 0  # Add this line to track peak memory
+
     def _build_model_optimizer(self,
                                model_path,
                                fsdp_config,
@@ -415,6 +417,10 @@ class ActorRolloutRefWorker(Worker):
 
         torch.cuda.empty_cache()
 
+        # Reset stats for all ranks
+        torch.cuda.reset_peak_memory_stats(0)
+        self.peak_gpu_memory = 0
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         # Support all hardwares
@@ -447,6 +453,11 @@ class ActorRolloutRefWorker(Worker):
             metrics['actor/lr'] = lr
 
             log_gpu_memory_usage('After update policy', logger=logger)
+
+            # Track memory for all ranks
+            current_gpu_memory = torch.cuda.memory_allocated(0)
+            self.peak_gpu_memory = max(self.peak_gpu_memory, current_gpu_memory)
+            metrics['memory/gpu_peak_mb'] = self.peak_gpu_memory / (1024 * 1024)
 
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={'metrics': metrics})
