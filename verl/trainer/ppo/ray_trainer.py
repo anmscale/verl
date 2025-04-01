@@ -899,6 +899,10 @@ class RayPPOTrainer(object):
         """
         from verl.utils.tracking import Tracking
         from omegaconf import OmegaConf
+        import psutil
+        
+        peak_cpu_memory = 0
+        process = psutil.Process()
 
         logger = Tracking(project_name=self.config.trainer.project_name,
                           experiment_name=self.config.trainer.experiment_name,
@@ -1037,6 +1041,15 @@ class RayPPOTrainer(object):
                 n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
                 # Implement actual tflpo and theoretical tflpo
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+
+                # Track peak memory for CPU
+                cpu_memory = process.memory_info().rss  # Real memory usage
+                
+                peak_cpu_memory = max(peak_cpu_memory, cpu_memory)
+                
+                metrics.update({
+                    'memory/cpu_peak_mb': peak_cpu_memory / (1024 * 1024),
+                })
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

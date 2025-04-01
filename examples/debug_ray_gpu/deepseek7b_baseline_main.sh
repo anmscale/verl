@@ -1,6 +1,6 @@
 set -x
 
-export EXP_NAME='deepseek7b_baseline_branch'
+export EXP_NAME='deepseek7b_baseline_main'
 export WANDB_API_KEY='34b8f32abb7ba71277361c99f84d9bea484b5d3b'
 
 python3 -m verl.trainer.main_ppo \
@@ -42,7 +42,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
     trainer.default_local_dir=/mnt/local_storage/verl/$EXP_NAME \
-    trainer.total_epochs=5 \
+    trainer.total_epochs=3 \
     trainer.resume_mode=disable \
     +trainer.val_before_train=False $@
 
