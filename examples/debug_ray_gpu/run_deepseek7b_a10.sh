@@ -1,9 +1,5 @@
 set -x
 
-PROJECT_NAME='misc'
-EXPERIMENT_NAME='1.5b-sync-example'
-
-export WANDB_PROJECT=$PROJECT_NAME
 export WANDB_API_KEY='34b8f32abb7ba71277361c99f84d9bea484b5d3b'
 
 python3 -m verl.trainer.main_ppo \

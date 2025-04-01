@@ -43,27 +43,7 @@ def _timer(name: str, timing_raw: Dict[str, float]):
 class RayPPOTrainerSimple(RayPPOTrainer):
     """
     Simplified version of RayPPOTrainer focusing only on the generation step
-    """
-    
-    def _init_resource_pool(self):
-        """Initialize resource pool"""
-        super()._init_resource_pool()
-        resource_pool = self.resource_pool_manager.get_resource_pool(Role.Scoring)
-        scoring_cls = RayClassWithInitArgs(
-            cls=self.role_worker_mapping[Role.Scoring],
-            config=self.config,
-            reward_fn=self.reward_fn,
-            kl_ctrl=self.kl_ctrl,
-        )
-        self.resource_pool_to_cls[resource_pool]["scoring"] = scoring_cls
-
-    def _init_colocated_worker_groups(self):
-        super()._init_colocated_worker_groups()
-        
-        # Initialize scoring worker group
-        self.scoring_wg = self.all_wg["scoring"]
-        self.scoring_wg.init_model()
-        
+    """    
 
     def fit(self):
         """
