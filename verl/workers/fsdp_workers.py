@@ -1207,7 +1207,7 @@ class ScoringWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_token_level_scores(self, data: DataProto):
-        from verl.trainer.ppo.ray_trainer import apply_kl_penalty
+        from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage
         
         data = data.to('cpu')
         # Compute rewards
@@ -1222,9 +1222,15 @@ class ScoringWorker(Worker):
             data.meta_info['metrics'] = kl_metrics
         else:
             data.batch['token_level_rewards'] = data.batch['token_level_scores']
+            
+        # Compute advantages
+        data = compute_advantage(data,
+                                 adv_estimator=self.config.algorithm.adv_estimator,
+                                 gamma=self.config.algorithm.gamma,
+                                 lam=self.config.algorithm.lam,
+                                 num_repeat=self.config.actor_rollout_ref.rollout.n)
         
         return data
-
     
     # Consider to do this on rank 0 only...
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

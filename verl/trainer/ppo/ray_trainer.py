@@ -991,13 +991,13 @@ class RayPPOTrainer(object):
                         # compute local valid tokens
                         batch = self.scoring_wg.compute_token_level_scores(batch, blocking=materialize_data)
                         
-                        # compute advantages, executed on the driver process
-                        batch = batch.get() if not materialize_data else batch
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+                        # # compute advantages, executed on the driver process
+                        # batch = batch.get() if not materialize_data else batch
+                        # batch = compute_advantage(batch,
+                        #                           adv_estimator=self.config.algorithm.adv_estimator,
+                        #                           gamma=self.config.algorithm.gamma,
+                        #                           lam=self.config.algorithm.lam,
+                        #                           num_repeat=self.config.actor_rollout_ref.rollout.n)
 
                     # update critic
                     training_output = []
