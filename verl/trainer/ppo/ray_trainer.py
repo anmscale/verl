@@ -939,16 +939,17 @@ class RayPPOTrainer(object):
                                                          dtype=object)
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                materialize_data = self.config.trainer.materialize_data
 
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
-                        batch = self.actor_rollout_wg.generate_sequences(batch, blocking=True)
+                        batch = self.actor_rollout_wg.generate_sequences(batch, blocking=materialize_data)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        assert False, 'REMAX is not supported yet'
+                        assert materialize_data, 'REMAX is not supported yet when materialize_data is False'
                         with _timer('gen_max', timing_raw):
-                            gen_baseline_batch = deepcopy(gen_batch)
+                            gen_baseline_batch = deepcopy(batch)
                             gen_baseline_batch.meta_info['do_sample'] = False
                             gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
 
@@ -964,35 +965,34 @@ class RayPPOTrainer(object):
 
                     # recompute old_log_probs
                     with _timer('old_log_prob', timing_raw):
-                        batch = self.actor_rollout_wg.compute_log_prob(batch, blocking=True)
+                        batch = self.actor_rollout_wg.compute_log_prob(batch, blocking=materialize_data)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
-                            batch = self.ref_policy_wg.compute_ref_log_prob(batch, blocking=False)
+                            batch = self.ref_policy_wg.compute_ref_log_prob(batch, blocking=materialize_data)
 
                     # compute values
                     if self.use_critic:
                         with _timer('values', timing_raw):
-                            batch = self.critic_wg.compute_values(batch, blocking=False)
+                            batch = self.critic_wg.compute_values(batch, blocking=materialize_data)
 
                     with _timer('adv', timing_raw):
                         # compute scores. Support both model and function-based.
                         # We first compute the scores using reward model. Then, we call reward_fn to combine
                         # the results from reward model and rule-based results.
-                        # if self.use_rm:
-                        #     # we first compute reward model score
-                        #     reward_tensor = self.rm_wg.compute_rm_score(batch)
-                        #     batch = batch.union(reward_tensor)
-                        assert not self.use_rm, 'reward model is not supported yet'
-                        # compute local valid tokens
-                        batch = self.scoring_wg.compute_token_level_scores(batch, blocking=True)
-                        
-                        # # compute global valid tokens
-                        # batch.meta_info['global_token_num'] = batch.non_tensor_batch['local_token_num'].tolist()
-                        # assert len(batch.meta_info['global_token_num']) == self.config.data.train_batch_size
 
+                        if self.use_rm:
+                            assert materialize_data, 'reward model is not supported yet when materialize_data is False'
+                            # we first compute reward model score
+                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            batch = batch.union(reward_tensor)
+                        
+                        # compute local valid tokens
+                        batch = self.scoring_wg.compute_token_level_scores(batch, blocking=materialize_data)
+                        
                         # compute advantages, executed on the driver process
+                        batch = batch.get() if not materialize_data else batch
                         batch = compute_advantage(batch,
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma,
@@ -1003,18 +1003,18 @@ class RayPPOTrainer(object):
                     training_output = []
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch, blocking=True)
+                            critic_output = self.critic_wg.update_critic(batch, blocking=materialize_data)
                             training_output.append(critic_output)
                             
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch, blocking=True)
+                            actor_output = self.actor_rollout_wg.update_actor(batch, blocking=materialize_data)
                             training_output.append(actor_output)
                     
-                    # # Materialize training outputs and reduce metrics
-                    # training_output = [x.get() for x in training_output]
+                    # compute reduced metrics
+                    training_output = [x.get() for x in training_output] if not materialize_data else training_output
                     output_metrics = [reduce_metrics(o.meta_info['metrics']) for o in training_output]
                     for om in output_metrics:
                         metrics.update(om)

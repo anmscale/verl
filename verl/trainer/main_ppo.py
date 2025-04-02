@@ -15,7 +15,6 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo.ray_trainer_simple import RayPPOTrainerSimple
 import ray
 import hydra
 import os
@@ -28,13 +27,12 @@ def main(config):
 def run_ppo(config, compute_score=None):
     if not ray.is_initialized():
         # this is for local ray cluster
-        print("WANDB_API_KEY", os.environ.get("WANDB_API_KEY"))
         ray.init(
             runtime_env={
                 "env_vars": {
                     "TOKENIZERS_PARALLELISM": "true",
                     "NCCL_DEBUG": "WARN",
-                    "WANDB_API_KEY": os.environ.get("WANDB_API_KEY"),
+                    "WANDB_API_KEY": os.environ.get("WANDB_API_KEY", ""),
                     "CUDA_LAUNCH_BLOCKING": "1",
                 }
             }
@@ -129,12 +127,7 @@ def main_task(config, compute_score=None):
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-    if config.trainer.simple_mode:
-        trainer_cls = RayPPOTrainerSimple
-    else:
-        trainer_cls = RayPPOTrainer
-
-    trainer = trainer_cls(config=config,
+    trainer = RayPPOTrainer(config=config,
                             tokenizer=tokenizer,
                             processor=processor,
                             role_worker_mapping=role_worker_mapping,
