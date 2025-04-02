@@ -41,6 +41,7 @@ from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.tracking import ValidationGenerationsLogger
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
+import psutil
 
 WorkerType = Type[Worker]
 
@@ -447,6 +448,10 @@ class RayPPOTrainer(object):
             self.use_critic = False
         else:
             raise NotImplementedError
+
+        self.peak_gpu_memory = 0
+        self.peak_cpu_memory = 0
+        self.process = psutil.Process()
 
         self._validate_config()
         self._create_dataloader()
@@ -1050,6 +1055,15 @@ class RayPPOTrainer(object):
                 n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
                 # Implement actual tflpo and theoretical tflpo
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                
+                # Track CPU memory
+                current_cpu_memory = self.process.memory_info().rss
+                self.peak_cpu_memory = max(self.peak_cpu_memory, current_cpu_memory)
+
+                # Add memory metrics
+                metrics.update({
+                    'memory/cpu_peak_mb': self.peak_cpu_memory / (1024 * 1024),
+                })
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

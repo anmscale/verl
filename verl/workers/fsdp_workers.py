@@ -136,6 +136,9 @@ class ActorRolloutRefWorker(Worker):
                                                            self.ulysses_sequence_parallel_size)
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
+        # Add peak GPU memory tracking
+        self.peak_gpu_memory = 0
+
     def _build_model_optimizer(self,
                                model_path,
                                fsdp_config,
@@ -437,6 +440,11 @@ class ActorRolloutRefWorker(Worker):
             global_num_tokens = data.meta_info['global_token_num']
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
             metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+
+            # Track GPU memory
+            current_gpu_memory = torch.cuda.memory_allocated(0)
+            self.peak_gpu_memory = max(self.peak_gpu_memory, current_gpu_memory)
+            metrics['memory/gpu_peak_mb'] = self.peak_gpu_memory / (1024 * 1024)
 
             self.actor_lr_scheduler.step()
             lr = self.actor_lr_scheduler.get_last_lr()[0]
