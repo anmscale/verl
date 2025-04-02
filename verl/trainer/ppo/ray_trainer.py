@@ -945,6 +945,7 @@ class RayPPOTrainer(object):
                     # generate a batch
                     with _timer('gen', timing_raw):
                         batch = self.actor_rollout_wg.generate_sequences(batch, blocking=materialize_data)
+                        peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         assert materialize_data, 'REMAX is not supported yet when materialize_data is False'
@@ -966,16 +967,19 @@ class RayPPOTrainer(object):
                     # recompute old_log_probs
                     with _timer('old_log_prob', timing_raw):
                         batch = self.actor_rollout_wg.compute_log_prob(batch, blocking=materialize_data)
+                        peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
                             batch = self.ref_policy_wg.compute_ref_log_prob(batch, blocking=materialize_data)
+                            peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     # compute values
                     if self.use_critic:
                         with _timer('values', timing_raw):
                             batch = self.critic_wg.compute_values(batch, blocking=materialize_data)
+                            peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     with _timer('adv', timing_raw):
                         # compute scores. Support both model and function-based.
@@ -990,9 +994,9 @@ class RayPPOTrainer(object):
                         
                         # compute local valid tokens
                         batch = self.scoring_wg.compute_token_level_scores(batch, blocking=materialize_data)
+                        peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
                         
                         # # compute advantages, executed on the driver process
-                        # batch = batch.get() if not materialize_data else batch
                         # batch = compute_advantage(batch,
                         #                           adv_estimator=self.config.algorithm.adv_estimator,
                         #                           gamma=self.config.algorithm.gamma,
@@ -1005,6 +1009,7 @@ class RayPPOTrainer(object):
                         with _timer('update_critic', timing_raw):
                             critic_output = self.critic_wg.update_critic(batch, blocking=materialize_data)
                             training_output.append(critic_output)
+                            peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
                             
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -1012,12 +1017,14 @@ class RayPPOTrainer(object):
                         with _timer('update_actor', timing_raw):
                             actor_output = self.actor_rollout_wg.update_actor(batch, blocking=materialize_data)
                             training_output.append(actor_output)
+                            peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
                     
                     # compute reduced metrics
                     training_output = [x.get() for x in training_output] if not materialize_data else training_output
                     output_metrics = [reduce_metrics(o.meta_info['metrics']) for o in training_output]
                     for om in output_metrics:
                         metrics.update(om)
+                    peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
@@ -1034,6 +1041,7 @@ class RayPPOTrainer(object):
                             self._save_checkpoint()
 
                 # collect metrics
+                batch = batch.get() if not materialize_data else batch
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
@@ -1041,11 +1049,6 @@ class RayPPOTrainer(object):
                 n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
                 # Implement actual tflpo and theoretical tflpo
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-
-                # Track peak memory for CPU
-                cpu_memory = process.memory_info().rss  # Real memory usage
-                
-                peak_cpu_memory = max(peak_cpu_memory, cpu_memory)
                 
                 metrics.update({
                     'memory/cpu_peak_mb': peak_cpu_memory / (1024 * 1024),
