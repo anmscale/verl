@@ -24,6 +24,7 @@ from enum import Enum
 from pprint import pprint
 from typing import Type, Dict
 from copy import deepcopy
+from functools import partial
 
 import ray
 import numpy as np
@@ -37,7 +38,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
-from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn, fake_collate_fn
 from verl.utils.tracking import ValidationGenerationsLogger
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -554,12 +555,18 @@ class RayPPOTrainer(object):
             sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
+            
+        if self.config.data.get('fake_data', False):
+            data_size = (self.config.data.train_batch_size, self.config.data.max_prompt_length, self.config.data.fake_data_emb_size)
+            train_collate_fn = partial(fake_collate_fn, data_size=data_size)
+        else:
+            train_collate_fn = collate_fn
 
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
                                                    batch_size=self.config.data.train_batch_size,
                                                    num_workers=8,
                                                    drop_last=True,
-                                                   collate_fn=collate_fn,
+                                                   collate_fn=train_collate_fn,
                                                    sampler=sampler)
 
         self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
@@ -933,6 +940,9 @@ class RayPPOTrainer(object):
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                metrics.update({
+                    'memory/data_size_mb': batch.get_size_mb(),
+                })
 
                 # Add unique IDs to the batch
                 batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],

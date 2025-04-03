@@ -247,6 +247,25 @@ class DataProto:
             message = f'{prefix}, ' + message
         print(message)
 
+    def get_size_mb(self) -> float:
+        """Get the total size of the DataProto in MB.
+        """
+        size_of_tensordict = 0
+        if self.batch is not None:
+            for key, tensor in self.batch.items():
+                size_of_tensordict += tensor.element_size() * tensor.numel()
+        
+        size_of_numpy_array = 0
+        for key, numpy_array in self.non_tensor_batch.items():
+            size_of_numpy_array += numpy_array.nbytes
+
+        # Convert to GB
+        size_of_numpy_array /= 1024**2
+        size_of_tensordict /= 1024**2
+        total_size = size_of_numpy_array + size_of_tensordict
+        
+        return total_size
+
     def check_consistency(self):
         """Check the consistency of the DataProto. Mainly for batch and non_tensor_batch
         We expose this function as a public one so that user can call themselves directly
