@@ -139,7 +139,15 @@ class ActorRolloutRefWorker(Worker):
                                                            self.ulysses_sequence_parallel_size)
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
-        self.peak_gpu_memory = 0  # Add this line to track peak memory
+    def _update_peak_memory(self):
+        current_memory = torch.cuda.memory_allocated(0)
+        self.peak_gpu_memory = max(self.peak_gpu_memory, current_memory)
+
+    def _report_and_reset_peak_memory(self, metrics, prefix=''):
+        metrics[f'memory/{prefix}gpu_peak_mb'] = self.peak_gpu_memory / (1024 * 1024)
+        # Reset for next tracking period
+        self.peak_gpu_memory = 0
+        torch.cuda.reset_peak_memory_stats(0)
 
     def _build_model_optimizer(self,
                                model_path,
@@ -416,8 +424,7 @@ class ActorRolloutRefWorker(Worker):
                 processing_class=self.processor if self.processor is not None else self.tokenizer)
 
         torch.cuda.empty_cache()
-
-        # Reset stats for all ranks
+        # Initialize peak memory tracking
         torch.cuda.reset_peak_memory_stats(0)
         self.peak_gpu_memory = 0
 
@@ -440,28 +447,26 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             # perform training
+            self._update_peak_memory()  # Track after preprocessing
+            
             with Timer(name='update_policy', logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
-
+                
             # delta_time = timer.last
             # global_num_tokens = data.meta_info['global_token_num']
             # estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
             # metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
 
             self.actor_lr_scheduler.step()
+            self._update_peak_memory()  # Track after policy update
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics['actor/lr'] = lr
 
             log_gpu_memory_usage('After update policy', logger=logger)
 
-            # Track memory for all ranks
-            current_gpu_memory = torch.cuda.memory_allocated(0)
-            self.peak_gpu_memory = max(self.peak_gpu_memory, current_gpu_memory)
-            metrics['memory/gpu_peak_mb'] = self.peak_gpu_memory / (1024 * 1024)
-
-            # TODO: here, we should return all metrics
+            self._report_and_reset_peak_memory(metrics, prefix='actor_')  # Report and reset
+            
             output = DataProto(meta_info={'metrics': metrics})
-
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
             output = output.to('cpu')
 
@@ -503,11 +508,15 @@ class ActorRolloutRefWorker(Worker):
 
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
             prompts_full = self.rollout_sharding_manager.preprocess_data(prompts)
+            self._update_peak_memory()  # Track after preprocessing
+            
             output = self.rollout.generate_sequences(prompts=prompts_full)
-
+            
             log_gpu_memory_usage('After rollout generation', logger=logger)
-
+            self._update_peak_memory()  # Track after generation
+            
             output = self.rollout_sharding_manager.postprocess_data(output)
+            self._update_peak_memory()  # Track after postprocessing
 
         # override the prompts tensordict with the output tensordict (instead of using union)
         prompts.batch.update(output.batch)
@@ -539,10 +548,15 @@ class ActorRolloutRefWorker(Worker):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
+            self._update_peak_memory()  # Track after preprocessing
+            
             output = self.actor.compute_log_prob(data=data)
+            self._update_peak_memory()  # Track after compute
+            
             output = DataProto.from_dict(tensors={'old_log_probs': output},
                                          meta_info={'temperature': self.config.rollout.temperature})
             output = self.ulysses_sharding_manager.postprocess_data(output)
+            self._update_peak_memory()  # Track after postprocessing
 
         # adding union to the worker function
         output = output.union(data)
@@ -576,9 +590,13 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
+            self._update_peak_memory()  # Track after preprocessing
+            
             output = self.ref_policy.compute_log_prob(data=data)
+            self._update_peak_memory()  # Track after compute
             output = DataProto.from_dict(tensors={'ref_log_prob': output})
             output = self.ulysses_sharding_manager.postprocess_data(output)
+            self._update_peak_memory()  # Track after postprocessing
 
         # adding union to the worker function
         output = output.union(data)
@@ -666,6 +684,16 @@ class CriticWorker(Worker):
                 f'normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}'
             assert self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu > 0, \
                 f'normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}'
+        
+    def _update_peak_memory(self):
+        current_memory = torch.cuda.memory_allocated(0)
+        self.peak_gpu_memory = max(self.peak_gpu_memory, current_memory)
+
+    def _report_and_reset_peak_memory(self, metrics, prefix=''):
+        metrics[f'memory/{prefix}gpu_peak_mb'] = self.peak_gpu_memory / (1024 * 1024)
+        # Reset for next tracking period
+        self.peak_gpu_memory = 0
+        torch.cuda.reset_peak_memory_stats(0)
 
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary
@@ -812,6 +840,9 @@ class CriticWorker(Worker):
             processing_class=self.processor if self.processor is not None else self.tokenizer)
 
         torch.cuda.empty_cache()
+        # Initialize peak memory tracking
+        torch.cuda.reset_peak_memory_stats(0)
+        self.peak_gpu_memory = 0
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_values(self, data: DataProto):
@@ -828,9 +859,14 @@ class CriticWorker(Worker):
         # perform forward computation
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            self._update_peak_memory()  # Track after preprocessing
+            
             values = self.critic.compute_values(data=data)
+            self._update_peak_memory()  # Track after compute
+            
             output = DataProto.from_dict(tensors={'values': values})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            self._update_peak_memory()  # Track after postprocessing
 
         # adding union to the worker function
         output = output.union(data)
@@ -851,19 +887,23 @@ class CriticWorker(Worker):
         # perform forward computation
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
-
+            self._update_peak_memory()  # Track after preprocessing
+            
             with Timer(name='update_critic', logger=None) as timer:
                 metrics = self.critic.update_critic(data=data)
-            
+                
             # delta_time = timer.last
             # global_num_tokens = data.meta_info['global_token_num']
             # estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
             # metrics['mfu/critic'] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
-
+            
             self.critic_lr_scheduler.step()
+            self._update_peak_memory()  # Track after update
             lr = self.critic_lr_scheduler.get_last_lr()[0]
             metrics['critic/lr'] = lr
-
+            
+            self._report_and_reset_peak_memory(metrics, prefix='critic_')  # Report and reset
+            
             output = DataProto(batch=None, meta_info={'metrics': metrics})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
