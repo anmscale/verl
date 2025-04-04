@@ -38,10 +38,11 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
-from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn, fake_collate_fn
+from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn, large_data_collate_fn
 from verl.utils.tracking import ValidationGenerationsLogger
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
+from verl.protocol import DataProtoFuture
 
 WorkerType = Type[Worker]
 
@@ -556,9 +557,9 @@ class RayPPOTrainer(object):
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
             
-        if self.config.data.get('fake_data', False):
-            data_size = (self.config.data.train_batch_size, self.config.data.max_prompt_length, self.config.data.fake_data_emb_size)
-            train_collate_fn = partial(fake_collate_fn, data_size=data_size)
+        if self.config.data.get('large_data', False):
+            data_size = (self.config.data.train_batch_size, self.config.data.max_prompt_length, self.config.data.large_data_emb_size)
+            train_collate_fn = partial(large_data_collate_fn, data_size=data_size)
         else:
             train_collate_fn = collate_fn
 
@@ -955,6 +956,8 @@ class RayPPOTrainer(object):
                     # generate a batch
                     with _timer('gen', timing_raw):
                         batch = self.actor_rollout_wg.generate_sequences(batch, blocking=materialize_data)
+                        if not materialize_data:
+                            assert isinstance(batch, DataProtoFuture)
                         peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
@@ -977,18 +980,24 @@ class RayPPOTrainer(object):
                     # recompute old_log_probs
                     with _timer('old_log_prob', timing_raw):
                         batch = self.actor_rollout_wg.compute_log_prob(batch, blocking=materialize_data)
+                        if not materialize_data:
+                            assert isinstance(batch, DataProtoFuture)
                         peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
                             batch = self.ref_policy_wg.compute_ref_log_prob(batch, blocking=materialize_data)
+                            if not materialize_data:
+                                assert isinstance(batch, DataProtoFuture)
                             peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     # compute values
                     if self.use_critic:
                         with _timer('values', timing_raw):
                             batch = self.critic_wg.compute_values(batch, blocking=materialize_data)
+                            if not materialize_data:
+                                assert isinstance(batch, DataProtoFuture)
                             peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     with _timer('adv', timing_raw):
@@ -1004,6 +1013,8 @@ class RayPPOTrainer(object):
                         
                         # compute local valid tokens
                         batch = self.scoring_wg.compute_token_level_scores(batch, blocking=materialize_data)
+                        if not materialize_data:
+                            assert isinstance(batch, DataProtoFuture)
                         peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
                         
                         # # compute advantages, executed on the driver process
@@ -1018,6 +1029,8 @@ class RayPPOTrainer(object):
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
                             critic_output = self.critic_wg.update_critic(batch, blocking=materialize_data)
+                            if not materialize_data:
+                                assert isinstance(critic_output, DataProtoFuture)
                             training_output.append(critic_output)
                             peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
                             
@@ -1026,6 +1039,8 @@ class RayPPOTrainer(object):
                         # update actor
                         with _timer('update_actor', timing_raw):
                             actor_output = self.actor_rollout_wg.update_actor(batch, blocking=materialize_data)
+                            if not materialize_data:
+                                assert isinstance(actor_output, DataProtoFuture)
                             training_output.append(actor_output)
                             peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
                     

@@ -1,6 +1,6 @@
 set -x
 
-export EXP_NAME='fake_baseline_branch'
+export EXP_NAME='large_data_baseline_branch'
 export WANDB_API_KEY='34b8f32abb7ba71277361c99f84d9bea484b5d3b'
 export BATCH_MULTIPLIER=1
 python3 -m verl.trainer.main_ppo \
@@ -11,8 +11,8 @@ python3 -m verl.trainer.main_ppo \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    data.fake_data=True \
-    data.fake_data_emb_size=1024 \
+    data.large_data=True \
+    data.large_data_emb_size=1024 \
     actor_rollout_ref.model.path=deepseek-ai/deepseek-llm-7b-chat \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
