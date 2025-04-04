@@ -561,6 +561,10 @@ class DataProto:
             non_tensor_batch[key] = np.concatenate(val, axis=0)
 
         return DataProto(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=data[0].meta_info)
+    
+    @staticmethod
+    def dispatch(x: 'DataProto', i: int, chunks: int):
+        return x.chunk(chunks=chunks)[i]
 
     def reorder(self, indices):
         """
@@ -640,18 +644,23 @@ class DataProtoFuture:
         output = DataProtoFuture(collect_fn=DataProto.concat, futures=data)
         return output
 
+    def select(self, chunks: int) -> List['DataProtoFuture']:
+        arg_future_lst = []
+        for i in range(chunks):
+            arg_future = DataProtoFuture(collect_fn=DataProto.concat,
+                                        dispatch_fn=None,
+                                        futures=[self.futures[i]])
+            arg_future_lst.append(arg_future)
+        return arg_future_lst
+
     def chunk(self, chunks: int) -> List['DataProtoFuture']:
         from functools import partial
 
         arg_future_lst = []
         for i in range(chunks):
-            # note that we can't directly pass i and chunks
-            def dispatch_fn(x, i, chunks):
-                return x.chunk(chunks=chunks)[i]
-
             arg_future = DataProtoFuture(collect_fn=self.collect_fn,
-                                         dispatch_fn=partial(dispatch_fn, i=i, chunks=chunks),
-                                         futures=self.futures)
+                                        dispatch_fn=partial(DataProto.dispatch, i=i, chunks=chunks),
+                                        futures=self.futures)
             arg_future_lst.append(arg_future)
         return arg_future_lst
 
