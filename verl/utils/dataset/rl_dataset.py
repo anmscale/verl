@@ -48,12 +48,12 @@ def collate_fn(data_list: list[dict]) -> dict:
     return {**tensors, **non_tensors}
 
 
-def fake_collate_fn(data_list: list[dict], data_size: tuple) -> dict:
+def large_data_collate_fn(data_list: list[dict], data_size: tuple) -> dict:
     # First collect real data
     result = collate_fn(data_list)
     
-    # Add fake data tensor
-    result['fake_inputs'] = torch.randn(data_size)
+    # Add large_data data tensor
+    result['large_data_inputs'] = torch.randn(data_size)
     
     return result
 
