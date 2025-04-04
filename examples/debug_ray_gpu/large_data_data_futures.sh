@@ -1,6 +1,6 @@
 set -x
 
-export EXP_NAME='large_data_baseline_branch'
+export EXP_NAME='large_data_data_futures'
 export WANDB_API_KEY='34b8f32abb7ba71277361c99f84d9bea484b5d3b'
 export BATCH_MULTIPLIER=1
 python3 -m verl.trainer.main_ppo \
@@ -46,7 +46,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir=/mnt/local_storage/verl/$EXP_NAME \
     trainer.total_epochs=3 \
     trainer.resume_mode=disable \
-    trainer.materialize_data=True \
+    trainer.materialize_data=False \
     +trainer.val_before_train=False $@
 
 
