@@ -1,6 +1,6 @@
 set -x
 
-export EXP_NAME='large_data_data_futures'
+export EXP_NAME='large_data_data_futures_opt1'
 export WANDB_API_KEY='34b8f32abb7ba71277361c99f84d9bea484b5d3b'
 export BATCH_MULTIPLIER=1
 python3 -m verl.trainer.main_ppo \
