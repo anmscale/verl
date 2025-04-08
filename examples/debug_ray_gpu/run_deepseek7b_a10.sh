@@ -1,7 +1,5 @@
 set -x
 
-export WANDB_API_KEY='34b8f32abb7ba71277361c99f84d9bea484b5d3b'
-
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=/mnt/cluster_storage/data/gsm8k/train.parquet \
