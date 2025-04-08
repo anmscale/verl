@@ -1017,17 +1017,10 @@ class RayPPOTrainer(object):
                             batch = batch.union(reward_tensor)
                         
                         # compute local valid tokens
-                        batch = self.scoring_wg.compute_token_level_scores(batch, blocking=materialize_data)
+                        batch = self.scoring_wg.compute_scores(batch, blocking=materialize_data)
                         if not materialize_data:
                             assert isinstance(batch, DataProtoFuture)
                         peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
-                        
-                        # # compute advantages, executed on the driver process
-                        # batch = compute_advantage(batch,
-                        #                           adv_estimator=self.config.algorithm.adv_estimator,
-                        #                           gamma=self.config.algorithm.gamma,
-                        #                           lam=self.config.algorithm.lam,
-                        #                           num_repeat=self.config.actor_rollout_ref.rollout.n)
 
                     # update critic
                     training_output = []

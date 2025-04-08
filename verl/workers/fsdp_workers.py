@@ -1247,7 +1247,7 @@ class ScoringWorker(Worker):
         pass
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_token_level_scores(self, data: DataProto):
+    def compute_scores(self, data: DataProto):
         from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage
         
         data = data.to('cpu')
@@ -1264,7 +1264,7 @@ class ScoringWorker(Worker):
         else:
             data.batch['token_level_rewards'] = data.batch['token_level_scores']
             
-        # Compute advantages
+        # Compute advantages (approximated for GAE)
         data = compute_advantage(data,
                                  adv_estimator=self.config.algorithm.adv_estimator,
                                  gamma=self.config.algorithm.gamma,
@@ -1272,24 +1272,7 @@ class ScoringWorker(Worker):
                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
         
         return data
-    
-    # Consider to do this on rank 0 only...
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_advantages(self, data: DataProto):
-        pass
-        # from verl.protocol import all_gather_data_proto_copy
-        # from verl.trainer.ppo.ray_trainer import compute_advantage
-        # # move data to GPU and exchange data with other workers
-        # data = data.to(torch.cuda.current_device())
-        # data = all_gather_data_proto_copy(data.batch, size=self.world_size, group=self.process_group)
-        
-        # # Compute advantages
-        # data = compute_advantage(
-        #     data,
-        #     gamma=self.algorithm_config.gamma,
-        #     lam=self.algorithm_config.lam,
-        #     adv_estimator=self.algorithm_config.adv_estimator,
-        # )
+
 
 def print_debug_info(method_name):
     """Print debug information including class name, rank, process ID and Ray actor ID."""

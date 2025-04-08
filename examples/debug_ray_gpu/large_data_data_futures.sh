@@ -1,8 +1,6 @@
 set -x
 
 export EXP_NAME='large_data_data_futures_opt2'
-
-export EXP_NAME='large_data_data_futures_opt2'
 [ -z "$WANDB_API_KEY" ] && { echo "Error: WANDB_API_KEY is not set"; exit 1; }
 
 export BATCH_MULTIPLIER=1
