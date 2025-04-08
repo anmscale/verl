@@ -530,12 +530,14 @@ class ActorRolloutRefWorker(Worker):
         return output
         
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_log_prob(self, data: DataProto):
+    def compute_log_prob(self, gen_batch_output: DataProto, data: DataProto):
+        
         # print_debug_info('compute_log_prob')
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-
+        data = data.union(gen_batch_output)
+        
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
         # we should always recompute old_log_probs when it is HybridEngine

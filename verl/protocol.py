@@ -202,9 +202,10 @@ class DataProto:
     def __getstate__(self):
         import io
         buffer = io.BytesIO()
-        if tensordict.__version__ >= '0.5.0' and self.batch is not None:
+        if tensordict.__version__ >= '0.5.0' and self.batch is not None and len(self.batch.keys()) > 0:
             self.batch = self.batch.contiguous()
             self.batch = self.batch.consolidate()
+            
         torch.save(self.batch, buffer)
         buffer_bytes = buffer.getvalue()
         return buffer_bytes, self.non_tensor_batch, self.meta_info

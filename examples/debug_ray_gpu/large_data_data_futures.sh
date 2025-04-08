@@ -1,7 +1,10 @@
 set -x
 
-export EXP_NAME='large_data_data_futures_opt1'
-export WANDB_API_KEY='34b8f32abb7ba71277361c99f84d9bea484b5d3b'
+export EXP_NAME='large_data_data_futures_opt2'
+
+export EXP_NAME='large_data_data_futures_opt2'
+[ -z "$WANDB_API_KEY" ] && { echo "Error: WANDB_API_KEY is not set"; exit 1; }
+
 export BATCH_MULTIPLIER=1
 python3 -m verl.trainer.main_ppo \
     data.train_files=/mnt/cluster_storage/data/gsm8k/train.parquet \

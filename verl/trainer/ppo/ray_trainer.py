@@ -948,6 +948,11 @@ class RayPPOTrainer(object):
                 # Add unique IDs to the batch
                 batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                          dtype=object)
+                
+                gen_batch = batch.pop(
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                    non_tensor_batch_keys=['raw_prompt_ids'],
+                )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 materialize_data = self.config.trainer.materialize_data
@@ -955,9 +960,9 @@ class RayPPOTrainer(object):
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
-                        batch = self.actor_rollout_wg.generate_sequences(batch, blocking=materialize_data)
+                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch, blocking=materialize_data)
                         if not materialize_data:
-                            assert isinstance(batch, DataProtoFuture)
+                            assert isinstance(gen_batch_output, DataProtoFuture)
                         peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
@@ -979,7 +984,7 @@ class RayPPOTrainer(object):
 
                     # recompute old_log_probs
                     with _timer('old_log_prob', timing_raw):
-                        batch = self.actor_rollout_wg.compute_log_prob(batch, blocking=materialize_data)
+                        batch = self.actor_rollout_wg.compute_log_prob(gen_batch_output, batch, blocking=materialize_data)
                         if not materialize_data:
                             assert isinstance(batch, DataProtoFuture)
                         peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
