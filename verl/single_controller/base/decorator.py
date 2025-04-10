@@ -40,6 +40,24 @@ class Dispatch(Enum):
 class Execute(Enum):
     ALL = 0
     RANK_ZERO = 1
+    
+def _split_args_kwargs_data_proto_fsdp_optim(chunks, *args, **kwargs):
+    from verl.protocol import DataProto, DataProtoFuture
+    splitted_args = []
+    for arg in args:
+        assert isinstance(arg, (DataProto, DataProtoFuture))
+        # optimization for fsdp N-to-N
+        if isinstance(arg, DataProtoFuture):
+            splitted_args.append(arg.select(chunks=chunks))
+        else:
+            splitted_args.append(arg.chunk(chunks=chunks))
+
+    splitted_kwargs = {}
+    for key, val in kwargs.items():
+        assert isinstance(val, (DataProto, DataProtoFuture))
+        splitted_kwargs[key] = val.chunk(chunks=chunks)
+
+    return splitted_args, splitted_kwargs
 
 
 def _split_args_kwargs_data_proto(chunks, *args, **kwargs):
@@ -272,7 +290,7 @@ def collect_dp_compute(worker_group, output):
 def dispatch_dp_compute_data_proto(worker_group, *args, **kwargs):
     from verl.single_controller.base.worker_group import WorkerGroup
     assert isinstance(worker_group, WorkerGroup)
-    splitted_args, splitted_kwargs = _split_args_kwargs_data_proto(worker_group.world_size, *args, **kwargs)
+    splitted_args, splitted_kwargs = _split_args_kwargs_data_proto_fsdp_optim(worker_group.world_size, *args, **kwargs)
     return splitted_args, splitted_kwargs
 
 

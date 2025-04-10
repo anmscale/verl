@@ -24,6 +24,7 @@ from enum import Enum
 from pprint import pprint
 from typing import Type, Dict
 from copy import deepcopy
+from functools import partial
 
 import ray
 import numpy as np
@@ -37,10 +38,11 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
-from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn, large_data_collate_fn
 from verl.utils.tracking import ValidationGenerationsLogger
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
+from verl.protocol import DataProtoFuture
 
 WorkerType = Type[Worker]
 
@@ -56,7 +58,7 @@ class Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
-
+    Scoring = 7
 
 class AdvantageEstimator(str, Enum):
     """
@@ -367,15 +369,16 @@ def compute_timing_metrics(batch, timing_raw):
 
 
 def compute_throughout_metrics(batch, timing_raw, n_gpus):
-    total_num_tokens = sum(batch.meta_info['global_token_num'])
+    # TODO: find a way to compute global token num
+    # total_num_tokens = sum(batch.meta_info['global_token_num'])
     time = timing_raw["step"]
     # estimated_flops, promised_flops = flops_function.estimate_flops(num_tokens, time)
     # f'Actual TFLOPs/s/GPU​': estimated_flops/(n_gpus),
     # f'Theoretical TFLOPs/s/GPU​': promised_flops,
     return {
-        f'total_num_tokens': total_num_tokens,
+        # f'total_num_tokens': total_num_tokens,
         f'time_per_step': time,
-        f'Tokens/Sec/GPU': total_num_tokens / (time * n_gpus),
+        # f'Tokens/Sec/GPU': total_num_tokens / (time * n_gpus),
     }
 
 
@@ -553,12 +556,18 @@ class RayPPOTrainer(object):
             sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
+            
+        if self.config.data.get('large_data', False):
+            data_size = (self.config.data.train_batch_size, self.config.data.max_prompt_length, self.config.data.large_data_emb_size)
+            train_collate_fn = partial(large_data_collate_fn, data_size=data_size)
+        else:
+            train_collate_fn = collate_fn
 
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
                                                    batch_size=self.config.data.train_batch_size,
                                                    num_workers=8,
                                                    drop_last=True,
-                                                   collate_fn=collate_fn,
+                                                   collate_fn=train_collate_fn,
                                                    sampler=sampler)
 
         self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
@@ -707,6 +716,7 @@ class RayPPOTrainer(object):
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
 
         return metric_dict
+    
 
     def init_workers(self):
         """Init resource pool and worker group"""
@@ -744,7 +754,16 @@ class RayPPOTrainer(object):
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool]['rm'] = rm_cls
-
+            
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.Scoring)
+        scoring_cls = RayClassWithInitArgs(
+            cls=self.role_worker_mapping[Role.Scoring],
+            config=self.config,
+            reward_fn=self.reward_fn,
+            kl_ctrl=self.kl_ctrl,
+        )
+        self.resource_pool_to_cls[resource_pool]["scoring"] = scoring_cls
+        
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
         # you should not use `create_colocated_worker_cls`. Instead, directly pass different resource pool to different worker groups.
@@ -774,6 +793,8 @@ class RayPPOTrainer(object):
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
+        
+        self.scoring_wg = all_wg["scoring"]
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -886,6 +907,10 @@ class RayPPOTrainer(object):
         """
         from verl.utils.tracking import Tracking
         from omegaconf import OmegaConf
+        import psutil
+        
+        peak_cpu_memory = 0
+        process = psutil.Process()
 
         logger = Tracking(project_name=self.config.trainer.project_name,
                           experiment_name=self.config.trainer.experiment_name,
@@ -916,29 +941,34 @@ class RayPPOTrainer(object):
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                metrics.update({
+                    'memory/data_size_mb': batch.get_size_mb(),
+                })
 
-                # pop those keys for generation
-                if 'multi_modal_inputs' in batch.non_tensor_batch.keys():
-                    gen_batch = batch.pop(
-                        batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                        non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
-                    )
-                else:
-                    gen_batch = batch.pop(
-                        batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                        non_tensor_batch_keys=['raw_prompt_ids'],
-                    )
+                # Add unique IDs to the batch
+                batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                                                         dtype=object)
+                
+                gen_batch = batch.pop(
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                    non_tensor_batch_keys=['raw_prompt_ids'],
+                )
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                materialize_data = self.config.trainer.materialize_data
 
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch, blocking=materialize_data)
+                        if not materialize_data:
+                            assert isinstance(gen_batch_output, DataProtoFuture)
+                        peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        assert materialize_data, 'REMAX is not supported yet when materialize_data is False'
                         with _timer('gen_max', timing_raw):
-                            gen_baseline_batch = deepcopy(gen_batch)
+                            gen_baseline_batch = deepcopy(batch)
                             gen_baseline_batch.meta_info['do_sample'] = False
                             gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
 
@@ -952,81 +982,72 @@ class RayPPOTrainer(object):
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                             dtype=object)
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
-
-                    # balance the number of valid tokens on each dp rank.
-                    # Note that this breaks the order of data inside the batch.
-                    # Please take care when you implement group based adv computation such as GRPO and rloo
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
-
-                    # compute global_valid tokens
-                    batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
-
                     # recompute old_log_probs
                     with _timer('old_log_prob', timing_raw):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        batch = batch.union(old_log_prob)
+                        batch = self.actor_rollout_wg.compute_log_prob(gen_batch_output, batch, blocking=materialize_data)
+                        if not materialize_data:
+                            assert isinstance(batch, DataProtoFuture)
+                        peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                            batch = self.ref_policy_wg.compute_ref_log_prob(batch, blocking=materialize_data)
+                            if not materialize_data:
+                                assert isinstance(batch, DataProtoFuture)
+                            peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     # compute values
                     if self.use_critic:
                         with _timer('values', timing_raw):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
+                            batch = self.critic_wg.compute_values(batch, blocking=materialize_data)
+                            if not materialize_data:
+                                assert isinstance(batch, DataProtoFuture)
+                            peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     with _timer('adv', timing_raw):
                         # compute scores. Support both model and function-based.
                         # We first compute the scores using reward model. Then, we call reward_fn to combine
                         # the results from reward model and rule-based results.
+
                         if self.use_rm:
+                            assert materialize_data, 'reward model is not supported yet when materialize_data is False'
                             # we first compute reward model score
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
-
-                        # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
-
-                        # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
-                            batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
-
-                        # compute advantages, executed on the driver process
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+                        
+                        # compute local valid tokens
+                        batch = self.scoring_wg.compute_scores(batch, blocking=materialize_data)
+                        if not materialize_data:
+                            assert isinstance(batch, DataProtoFuture)
+                        peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     # update critic
+                    training_output = []
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
-                        metrics.update(critic_output_metrics)
-
+                            critic_output = self.critic_wg.update_critic(batch, blocking=materialize_data)
+                            if not materialize_data:
+                                assert isinstance(critic_output, DataProtoFuture)
+                            training_output.append(critic_output)
+                            peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
+                            
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                        metrics.update(actor_output_metrics)
+                            actor_output = self.actor_rollout_wg.update_actor(batch, blocking=materialize_data)
+                            if not materialize_data:
+                                assert isinstance(actor_output, DataProtoFuture)
+                            training_output.append(actor_output)
+                            peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
+                    
+                    # compute reduced metrics
+                    training_output = [x.get() for x in training_output] if not materialize_data else training_output
+                    output_metrics = [reduce_metrics(o.meta_info['metrics']) for o in training_output]
+                    for om in output_metrics:
+                        metrics.update(om)
+                    peak_cpu_memory = max(peak_cpu_memory, process.memory_info().rss)
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
@@ -1043,6 +1064,7 @@ class RayPPOTrainer(object):
                             self._save_checkpoint()
 
                 # collect metrics
+                batch = batch.get() if not materialize_data else batch
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
@@ -1050,6 +1072,10 @@ class RayPPOTrainer(object):
                 n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
                 # Implement actual tflpo and theoretical tflpo
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                
+                metrics.update({
+                    'memory/cpu_peak_mb': peak_cpu_memory / (1024 * 1024),
+                })
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

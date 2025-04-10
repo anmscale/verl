@@ -15,10 +15,9 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-
 import ray
 import hydra
-
+import os
 
 def get_custom_reward_fn(config):
     import importlib.util, os
@@ -57,13 +56,16 @@ def run_ppo(config) -> None:
 
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={
-            'env_vars': {
-                'TOKENIZERS_PARALLELISM': 'true',
-                'NCCL_DEBUG': 'WARN',
-                'VLLM_LOGGING_LEVEL': 'WARN'
+        ray.init(
+            runtime_env={
+                "env_vars": {
+                    "TOKENIZERS_PARALLELISM": "true",
+                    "NCCL_DEBUG": "WARN",
+                    "WANDB_API_KEY": os.environ.get("WANDB_API_KEY", ""),
+                    'VLLM_LOGGING_LEVEL': 'WARN',
+                }
             }
-        })
+        )
 
     ray.get(main_task.remote(config))
 
@@ -88,7 +90,7 @@ def main_task(config):
     # define worker classes
     if config.actor_rollout_ref.actor.strategy == 'fsdp':
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-        from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
+        from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker, ScoringWorker
         from verl.single_controller.ray import RayWorkerGroup
         ray_worker_group_cls = RayWorkerGroup
 
@@ -97,18 +99,20 @@ def main_task(config):
         from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
         from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
         ray_worker_group_cls = NVMegatronRayWorkerGroup
+        from verl.workers.fsdp_workers import ScoringWorker
 
     else:
         raise NotImplementedError
 
     from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
+    
 
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
         Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
+        Role.RefPolicy: ray.remote(ActorRolloutRefWorker),
+        Role.Scoring: ray.remote(ScoringWorker),
     }
-
     global_pool_id = 'global_pool'
     resource_pool_spec = {
         global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
@@ -117,6 +121,7 @@ def main_task(config):
         Role.ActorRollout: global_pool_id,
         Role.Critic: global_pool_id,
         Role.RefPolicy: global_pool_id,
+        Role.Scoring: global_pool_id,
     }
 
     # we should adopt a multi-source reward function here
@@ -161,6 +166,7 @@ def main_task(config):
                             ray_worker_group_cls=ray_worker_group_cls,
                             reward_fn=reward_fn,
                             val_reward_fn=val_reward_fn)
+
     trainer.init_workers()
     trainer.fit()
 

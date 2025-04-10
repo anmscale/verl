@@ -24,7 +24,7 @@ import torch.distributed
 from torch.distributed.device_mesh import init_device_mesh
 import verl.utils.torch_functional as verl_F
 from omegaconf import DictConfig, open_dict
-from verl import DataProto
+from verl import DataProto, DataProtoFuture
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import register, Dispatch
 from verl.utils import hf_tokenizer, hf_processor
@@ -135,6 +135,16 @@ class ActorRolloutRefWorker(Worker):
             self.config.ref.log_prob_micro_batch_size //= (self.device_mesh.size() //
                                                            self.ulysses_sequence_parallel_size)
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
+
+    def _update_peak_memory(self):
+        current_memory = torch.cuda.memory_allocated(0)
+        self.peak_gpu_memory = max(self.peak_gpu_memory, current_memory)
+
+    def _report_and_reset_peak_memory(self, metrics, prefix=''):
+        metrics[f'memory/{prefix}gpu_peak_mb'] = self.peak_gpu_memory / (1024 * 1024)
+        # Reset for next tracking period
+        self.peak_gpu_memory = 0
+        torch.cuda.reset_peak_memory_stats(0)
 
     def _build_model_optimizer(self,
                                model_path,
@@ -341,6 +351,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        # print_debug_info('init_model')
         from verl.workers.actor import DataParallelPPOActor
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get('external_lib', None))
@@ -411,6 +422,9 @@ class ActorRolloutRefWorker(Worker):
                 processing_class=self.processor if self.processor is not None else self.tokenizer)
 
         torch.cuda.empty_cache()
+        # Initialize peak memory tracking
+        torch.cuda.reset_peak_memory_stats(0)
+        self.peak_gpu_memory = 0
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
@@ -431,22 +445,26 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             # perform training
+            self._update_peak_memory()  # Track after preprocessing
+            
             with Timer(name='update_policy', logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
-            delta_time = timer.last
-            global_num_tokens = data.meta_info['global_token_num']
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+                
+            # delta_time = timer.last
+            # global_num_tokens = data.meta_info['global_token_num']
+            # estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            # metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
 
             self.actor_lr_scheduler.step()
+            self._update_peak_memory()  # Track after policy update
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics['actor/lr'] = lr
 
             log_gpu_memory_usage('After update policy', logger=logger)
 
-            # TODO: here, we should return all metrics
+            self._report_and_reset_peak_memory(metrics, prefix='actor_')  # Report and reset
+            
             output = DataProto(meta_info={'metrics': metrics})
-
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
             output = output.to('cpu')
 
@@ -459,6 +477,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
+        # print_debug_info('generate_sequences')
         # Support all hardwares
         prompts = prompts.to(torch.cuda.current_device())
 
@@ -486,27 +505,39 @@ class ActorRolloutRefWorker(Worker):
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
-
-            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
-
+            prompts_full = self.rollout_sharding_manager.preprocess_data(prompts)
+            self._update_peak_memory()  # Track after preprocessing
+            
+            output = self.rollout.generate_sequences(prompts=prompts_full)
+            
             log_gpu_memory_usage('After rollout generation', logger=logger)
-
+            self._update_peak_memory()  # Track after generation
+            
             output = self.rollout_sharding_manager.postprocess_data(output)
+            self._update_peak_memory()  # Track after postprocessing
 
+        # override the prompts tensordict with the output tensordict (instead of using union)
+        prompts.batch.update(output.batch)
+        output = prompts
         output = output.to('cpu')
+        
+        # # compute local valid tokens
+        # output.non_tensor_batch['local_token_num'] = torch.sum(output.batch['attention_mask'], dim=-1).numpy()
 
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
-
+        
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_log_prob(self, data: DataProto):
+    def compute_log_prob(self, gen_batch_output: DataProto, data: DataProto):
+        
+        # print_debug_info('compute_log_prob')
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-
+        data = data.union(gen_batch_output)
+        
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
         # we should always recompute old_log_probs when it is HybridEngine
@@ -517,11 +548,18 @@ class ActorRolloutRefWorker(Worker):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
+            self._update_peak_memory()  # Track after preprocessing
+            
             output = self.actor.compute_log_prob(data=data)
+            self._update_peak_memory()  # Track after compute
+            
             output = DataProto.from_dict(tensors={'old_log_probs': output},
                                          meta_info={'temperature': self.config.rollout.temperature})
             output = self.ulysses_sharding_manager.postprocess_data(output)
+            self._update_peak_memory()  # Track after postprocessing
 
+        # adding union to the worker function
+        output = output.union(data)
         output = output.to('cpu')
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
@@ -537,6 +575,7 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
+        # print_debug_info('compute_ref_log_prob')
         assert self._is_ref
 
         # Support all hardwares
@@ -549,10 +588,16 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
+            self._update_peak_memory()  # Track after preprocessing
+            
             output = self.ref_policy.compute_log_prob(data=data)
+            self._update_peak_memory()  # Track after compute
             output = DataProto.from_dict(tensors={'ref_log_prob': output})
             output = self.ulysses_sharding_manager.postprocess_data(output)
+            self._update_peak_memory()  # Track after postprocessing
 
+        # adding union to the worker function
+        output = output.union(data)
         output = output.to('cpu')
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
@@ -637,6 +682,16 @@ class CriticWorker(Worker):
                 f'normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}'
             assert self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu > 0, \
                 f'normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}'
+        
+    def _update_peak_memory(self):
+        current_memory = torch.cuda.memory_allocated(0)
+        self.peak_gpu_memory = max(self.peak_gpu_memory, current_memory)
+
+    def _report_and_reset_peak_memory(self, metrics, prefix=''):
+        metrics[f'memory/{prefix}gpu_peak_mb'] = self.peak_gpu_memory / (1024 * 1024)
+        # Reset for next tracking period
+        self.peak_gpu_memory = 0
+        torch.cuda.reset_peak_memory_stats(0)
 
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary
@@ -760,6 +815,7 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        # print_debug_info('init_model')
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get('external_lib', None))
 
@@ -784,10 +840,13 @@ class CriticWorker(Worker):
             processing_class=self.processor if self.processor is not None else self.tokenizer)
 
         torch.cuda.empty_cache()
+        # Initialize peak memory tracking
+        torch.cuda.reset_peak_memory_stats(0)
+        self.peak_gpu_memory = 0
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_values(self, data: DataProto):
-
+        # print_debug_info('compute_values')
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
 
@@ -800,10 +859,17 @@ class CriticWorker(Worker):
         # perform forward computation
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            self._update_peak_memory()  # Track after preprocessing
+            
             values = self.critic.compute_values(data=data)
+            self._update_peak_memory()  # Track after compute
+            
             output = DataProto.from_dict(tensors={'values': values})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            self._update_peak_memory()  # Track after postprocessing
 
+        # adding union to the worker function
+        output = output.union(data)
         output = output.to('cpu')
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
@@ -821,19 +887,23 @@ class CriticWorker(Worker):
         # perform forward computation
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
-
+            self._update_peak_memory()  # Track after preprocessing
+            
             with Timer(name='update_critic', logger=None) as timer:
                 metrics = self.critic.update_critic(data=data)
-            delta_time = timer.last
-
-            global_num_tokens = data.meta_info['global_token_num']
-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics['mfu/critic'] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
-
+                
+            # delta_time = timer.last
+            # global_num_tokens = data.meta_info['global_token_num']
+            # estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            # metrics['mfu/critic'] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
+            
             self.critic_lr_scheduler.step()
+            self._update_peak_memory()  # Track after update
             lr = self.critic_lr_scheduler.get_last_lr()[0]
             metrics['critic/lr'] = lr
-
+            
+            self._report_and_reset_peak_memory(metrics, prefix='critic_')  # Report and reset
+            
             output = DataProto(batch=None, meta_info={'metrics': metrics})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
@@ -1155,3 +1225,66 @@ class RewardModelWorker(Worker):
         output = output.to('cpu')
         torch.cuda.empty_cache()
         return output
+
+
+class ScoringWorker(Worker):
+    """
+    Auxiliary worker that handles reward function, KL penalty, and advantage estimation.
+    """
+
+    def __init__(self, config, reward_fn, kl_ctrl):
+        super().__init__()
+        import torch.distributed
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        self.config = config
+        self.reward_fn = reward_fn
+        self.kl_ctrl = kl_ctrl
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        # No model initialization needed
+        pass
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_scores(self, data: DataProto):
+        from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage
+        
+        data = data.to('cpu')
+        # Compute rewards
+        reward_tensor = self.reward_fn(data)
+        data.batch["token_level_scores"] = reward_tensor
+        
+        # Apply KL penalty if reference policy is used and not using KL loss
+        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+            data, kl_metrics = apply_kl_penalty(data,
+                                                kl_ctrl=self.kl_ctrl,
+                                                kl_penalty=self.config.algorithm.kl_penalty)
+            data.meta_info['metrics'] = kl_metrics
+        else:
+            data.batch['token_level_rewards'] = data.batch['token_level_scores']
+            
+        # Compute advantages (approximated for GAE)
+        data = compute_advantage(data,
+                                 adv_estimator=self.config.algorithm.adv_estimator,
+                                 gamma=self.config.algorithm.gamma,
+                                 lam=self.config.algorithm.lam,
+                                 num_repeat=self.config.actor_rollout_ref.rollout.n)
+        
+        return data
+
+
+def print_debug_info(method_name):
+    """Print debug information including class name, rank, process ID and Ray actor ID."""
+    import os
+    import ray
+    import inspect
+    
+    # Get the calling class name
+    frame = inspect.currentframe().f_back
+    class_name = frame.f_locals.get('self').__class__.__name__
+    
+    # Get rank from the instance
+    rank = frame.f_locals.get('self').rank
+    
+    print(f"{class_name}.{method_name} Rank: {rank}, PID: {os.getpid()}, RayID: {ray.get_runtime_context().get_actor_id()}")

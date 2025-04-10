@@ -202,9 +202,10 @@ class DataProto:
     def __getstate__(self):
         import io
         buffer = io.BytesIO()
-        if tensordict.__version__ >= '0.5.0' and self.batch is not None:
+        if tensordict.__version__ >= '0.5.0' and self.batch is not None and len(self.batch.keys()) > 0:
             self.batch = self.batch.contiguous()
             self.batch = self.batch.consolidate()
+            
         torch.save(self.batch, buffer)
         buffer_bytes = buffer.getvalue()
         return buffer_bytes, self.non_tensor_batch, self.meta_info
@@ -246,6 +247,25 @@ class DataProto:
         if prefix:
             message = f'{prefix}, ' + message
         print(message)
+
+    def get_size_mb(self) -> float:
+        """Get the total size of the DataProto in MB.
+        """
+        size_of_tensordict = 0
+        if self.batch is not None:
+            for key, tensor in self.batch.items():
+                size_of_tensordict += tensor.element_size() * tensor.numel()
+        
+        size_of_numpy_array = 0
+        for key, numpy_array in self.non_tensor_batch.items():
+            size_of_numpy_array += numpy_array.nbytes
+
+        # Convert to GB
+        size_of_numpy_array /= 1024**2
+        size_of_tensordict /= 1024**2
+        total_size = size_of_numpy_array + size_of_tensordict
+        
+        return total_size
 
     def check_consistency(self):
         """Check the consistency of the DataProto. Mainly for batch and non_tensor_batch
@@ -542,6 +562,10 @@ class DataProto:
             non_tensor_batch[key] = np.concatenate(val, axis=0)
 
         return DataProto(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=data[0].meta_info)
+    
+    @staticmethod
+    def dispatch(x: 'DataProto', i: int, chunks: int):
+        return x.chunk(chunks=chunks)[i]
 
     def reorder(self, indices):
         """
@@ -621,22 +645,39 @@ class DataProtoFuture:
         output = DataProtoFuture(collect_fn=DataProto.concat, futures=data)
         return output
 
+    def select(self, chunks: int) -> List['DataProtoFuture']:
+        arg_future_lst = []
+        for i in range(chunks):
+            arg_future = DataProtoFuture(collect_fn=DataProto.concat,
+                                        dispatch_fn=None,
+                                        futures=[self.futures[i]])
+            arg_future_lst.append(arg_future)
+        return arg_future_lst
+
     def chunk(self, chunks: int) -> List['DataProtoFuture']:
         from functools import partial
 
         arg_future_lst = []
         for i in range(chunks):
-            # note that we can't directly pass i and chunks
-            def dispatch_fn(x, i, chunks):
-                return x.chunk(chunks=chunks)[i]
-
             arg_future = DataProtoFuture(collect_fn=self.collect_fn,
-                                         dispatch_fn=partial(dispatch_fn, i=i, chunks=chunks),
-                                         futures=self.futures)
+                                        dispatch_fn=partial(DataProto.dispatch, i=i, chunks=chunks),
+                                        futures=self.futures)
             arg_future_lst.append(arg_future)
         return arg_future_lst
 
     def get(self):
+        # # Track if this is being called from driver or actor
+        # from ray.air._internal import torch_utils
+        # device = torch_utils.get_devices()[0]
+        # caller_type = "driver" if device.type == 'cpu' else "actor"
+        
+        # # Get collect and dispatch function names
+        # collect_fn_name = getattr(self.collect_fn, "__name__", str(self.collect_fn))
+        # dispatch_fn_name = getattr(self.dispatch_fn, "__name__", str(self.dispatch_fn)) if self.dispatch_fn else "None"
+        
+        # print(f"DataProtoFuture.get() called from {caller_type} | collect_fn: {collect_fn_name} | dispatch_fn: {dispatch_fn_name}")
+        
+        # Original implementation
         output = ray.get(self.futures)  # dp_size.
         for o in output:
             assert isinstance(o, DataProto)
@@ -662,3 +703,66 @@ def all_gather_data_proto(data: DataProto, process_group):
     all_non_tensor_batch = [None for _ in range(group_size)]
     torch.distributed.all_gather_object(all_non_tensor_batch, data.non_tensor_batch, group=process_group)
     data.non_tensor_batch = {k: np.concatenate([d[k] for d in all_non_tensor_batch]) for k in data.non_tensor_batch}
+
+
+def all_gather_data_proto_copy(data: DataProto, process_group):
+    """
+    Gather DataProto objects from all processes in the group and return a new combined DataProto
+    without modifying the original data.
+    
+    Args:
+        data (DataProto): The local DataProto object
+        process_group: The process group for the all_gather operation
+        
+    Returns:
+        DataProto: A new DataProto containing the gathered data from all processes
+    """
+    group_size = torch.distributed.get_world_size(group=process_group)
+    assert isinstance(data, DataProto)
+    
+    # Create new TensorDict for the gathered batch (don't modify original)
+    if data.batch is not None:
+        # Move to current CUDA device for gathering, then back
+        device = torch.cuda.current_device()
+        batch_cuda = data.batch.to(device, non_blocking=True)
+        
+        # Use allgather_dict_tensors to combine tensors across processes
+        gathered_batch = allgather_dict_tensors(
+            batch_cuda.contiguous(), 
+            size=group_size, 
+            group=process_group, 
+            dim=0
+        )
+        
+        # Move back to original device if needed
+        if data.batch.device != device:
+            gathered_batch = gathered_batch.to(data.batch.device)
+    else:
+        gathered_batch = None
+    
+    # Handle non-tensor batch data
+    gathered_non_tensor_batch = {}
+    if data.non_tensor_batch:
+        # Gather non-tensor batch data without modifying original
+        all_non_tensor_batch = [None for _ in range(group_size)]
+        torch.distributed.all_gather_object(
+            all_non_tensor_batch, 
+            data.non_tensor_batch, 
+            group=process_group
+        )
+        
+        # Create a new dictionary by concatenating arrays
+        for key in data.non_tensor_batch:
+            arrays = [d[key] for d in all_non_tensor_batch if key in d]
+            if arrays:
+                gathered_non_tensor_batch[key] = np.concatenate(arrays)
+    
+    # Create a new meta_info (shallow copy is fine for this)
+    meta_info = {} if data.meta_info is None else dict(data.meta_info)
+    
+    # Return a new DataProto instance
+    return DataProto(
+        batch=gathered_batch,
+        non_tensor_batch=gathered_non_tensor_batch,
+        meta_info=meta_info
+    )

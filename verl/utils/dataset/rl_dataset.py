@@ -48,6 +48,16 @@ def collate_fn(data_list: list[dict]) -> dict:
     return {**tensors, **non_tensors}
 
 
+def large_data_collate_fn(data_list: list[dict], data_size: tuple) -> dict:
+    # First collect real data
+    result = collate_fn(data_list)
+    
+    # Add large_data data tensor
+    result['large_data_inputs'] = torch.randn(data_size)
+    
+    return result
+
+
 def process_image(image: dict, max_pixels: int = 2048 * 2048, min_pixels: int = 512 * 512):
     import math
     from io import BytesIO
