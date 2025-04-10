@@ -27,7 +27,6 @@ install_requires = [
   'datasets',
   'dill',
   'hydra-core',
-  'math-verify',
   'numpy',
   'pandas',
   'peft',
