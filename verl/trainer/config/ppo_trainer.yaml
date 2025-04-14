@@ -21,7 +21,9 @@ actor_rollout_ref:
   model:
     path: ~/models/deepseek-llm-7b-chat
     external_lib: null
-    override_config: { }
+    override_config: 
+      attn_implementation: null 
+      torch_dtype: float16 
     enable_gradient_checkpointing: True
     use_remove_padding: False
   actor:
@@ -47,14 +49,16 @@ actor_rollout_ref:
       warmup_style: constant  # select from constant/cosine
       total_training_steps: -1  # must be override by program
     fsdp_config:
-      wrap_policy:
+      model_dtype: float16  
         # transformer_layer_cls_to_wrap: None
+      wrap_policy:
         min_num_params: 0
       param_offload: False
       optimizer_offload: False
       fsdp_size: -1
   ref:
     fsdp_config:
+      model_dtype: float16  
       param_offload: False
       wrap_policy:
         # transformer_layer_cls_to_wrap: None
@@ -73,7 +77,7 @@ actor_rollout_ref:
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
-    dtype: bfloat16 # should align with FSDP
+    dtype: float16 # should align with FSDP
     gpu_memory_utilization: 0.5
     ignore_eos: False
     enforce_eager: True
@@ -105,11 +109,14 @@ critic:
   model:
     path: ~/models/deepseek-llm-7b-chat
     tokenizer_path: ${actor_rollout_ref.model.path}
-    override_config: { }
+    override_config: 
+      attn_implementation: null 
+      torch_dtype: float16  
     external_lib: ${actor_rollout_ref.model.external_lib}
     enable_gradient_checkpointing: True
     use_remove_padding: False
     fsdp_config:
+      model_dtype: float16  
       param_offload: False
       optimizer_offload: False
       wrap_policy:
@@ -137,8 +144,12 @@ reward_model:
     input_tokenizer: ${actor_rollout_ref.model.path}  # set this to null if the chat template is identical
     path: ~/models/FsfairX-LLaMA3-RM-v0.1
     external_lib: ${actor_rollout_ref.model.external_lib}
+    override_config:
+      attn_implementation: null  
+      torch_dtype: float16  
     use_remove_padding: False
     fsdp_config:
+      model_dtype: float16  
       wrap_policy:
         min_num_params: 0
       param_offload: False
