@@ -1077,6 +1077,13 @@ class RayPPOTrainer(object):
                     'memory/cpu_peak_mb': peak_cpu_memory / (1024 * 1024),
                 })
 
+                # GC in-actor object store
+                self.actor_rollout_wg.gc_in_actor_object_store()
+
+                # Remove in-actor object refs
+                worker = ray._private.worker.global_worker
+                worker.in_actor_object_refs = {}
+
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
