@@ -427,6 +427,13 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.reset_peak_memory_stats(0)
         self.peak_gpu_memory = 0
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def gc_in_actor_object_store(self):
+        import ray
+        worker = ray._private.worker.global_worker
+        print("GC in actor object store", worker.in_actor_object_store)
+        worker.in_actor_object_store = {}
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         # Support all hardwares
